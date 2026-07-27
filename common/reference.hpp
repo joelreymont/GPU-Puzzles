@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <vector>
 
 // CPU references. Double accumulators: the reference must be more accurate
 // than the kernel under test, not equally sloppy.
@@ -84,6 +85,26 @@ inline void ref_window_sum(const float* a, float* out, int n, int w) {
     for (int k = 0; k < w; k++) acc += (double)a[i + k];
     out[i] = (float)acc;
   }
+}
+
+// Iterative 3-point stencil (1D heat diffusion). One step is
+//   next[i] = 0.25*cur[i-1] + 0.5*cur[i] + 0.25*cur[i+1]
+// with clamped indexing at both ends: an out-of-array neighbour is the element
+// itself, so next[0] = 0.75*cur[0] + 0.25*cur[1]. `steps` full-array steps,
+// double buffers throughout -- the reference must be more accurate than the
+// kernel's float ping-pong, not equally sloppy.
+inline void ref_stencil_steps(const float* a, float* out, int n, int steps) {
+  std::vector<double> cur(n), nxt(n);
+  for (int i = 0; i < n; i++) cur[i] = (double)a[i];
+  for (int s = 0; s < steps; s++) {
+    for (int i = 0; i < n; i++) {
+      double l = cur[i > 0 ? i - 1 : 0];
+      double r = cur[i + 1 < n ? i + 1 : n - 1];
+      nxt[i] = 0.25 * l + 0.5 * cur[i] + 0.25 * r;
+    }
+    cur.swap(nxt);
+  }
+  for (int i = 0; i < n; i++) out[i] = (float)cur[i];
 }
 
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
