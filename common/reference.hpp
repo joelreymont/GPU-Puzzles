@@ -33,3 +33,28 @@ inline void ref_sub_warp_base(const float* a, float* out, int n) {
 inline void ref_shift_up(const float* a, float* out, int n) {
   for (int i = 0; i < n; i++) out[i] = (i % 32 == 0) ? 0.0f : a[i - 1];
 }
+
+// Group references accumulate, so they use a double accumulator per group.
+// A trailing group shorter than 32 sums only the elements that exist.
+
+// Every element of an aligned 32-element group receives that group's total.
+inline void ref_group_sum_all(const float* a, float* out, int n) {
+  for (int base = 0; base < n; base += 32) {
+    int end = (base + 32 < n) ? base + 32 : n;
+    double acc = 0.0;
+    for (int i = base; i < end; i++) acc += (double)a[i];
+    for (int i = base; i < end; i++) out[i] = (float)acc;
+  }
+}
+
+// Inclusive prefix sum restarted at every aligned 32-element group boundary.
+inline void ref_group_incl_scan(const float* a, float* out, int n) {
+  for (int base = 0; base < n; base += 32) {
+    int end = (base + 32 < n) ? base + 32 : n;
+    double acc = 0.0;
+    for (int i = base; i < end; i++) {
+      acc += (double)a[i];
+      out[i] = (float)acc;
+    }
+  }
+}
