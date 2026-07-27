@@ -133,6 +133,29 @@ inline void ref_transpose(const float* a, float* out, int rows, int cols) {
     for (int c = 0; c < cols; c++) out[c * rows + r] = a[r * cols + c];
 }
 
+// C = A * B, with A row-major M x K, B row-major K x N, C row-major M x N.
+// One double accumulator per output element, so this reference is more
+// accurate than any kernel under test rather than equally sloppy.
+//
+// The products are exact, not merely double-rounded: `a` and `b` hold float
+// values that came back through __half2float, so each has at most 11
+// significant bits and (double)a * (double)b needs at most 22 -- well inside
+// the 53 a double carries. Every kernel under test consumes those same
+// numbers. The only thing this reference does not reproduce is the order and
+// the width of the K-way accumulation, which is exactly what the runner's
+// tolerance is measuring and nothing else.
+inline void ref_gemm(const float* a, const float* b, float* c, int M, int N,
+                     int K) {
+  for (int i = 0; i < M; i++) {
+    for (int j = 0; j < N; j++) {
+      double acc = 0.0;
+      for (int k = 0; k < K; k++)
+        acc += (double)a[i * K + k] * (double)b[k * N + j];
+      c[i * N + j] = (float)acc;
+    }
+  }
+}
+
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
 // expression is character-identical to the kernel's so both round the same
 // way; the clamp keeps a value on or past the top edge inside the array.
