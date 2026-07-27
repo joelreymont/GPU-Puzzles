@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# CUDA build outputs
+GPU_puzzlers_exec/bin/
+build/
