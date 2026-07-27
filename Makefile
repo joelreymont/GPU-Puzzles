@@ -1,5 +1,8 @@
 ARCH ?= native
 NVCC ?= nvcc
+# RmProfilingAdminOnly=1 on this box; /etc/sudoers.d/joel-ncu grants NOPASSWD
+# for exactly this binary, so profiling works without interaction.
+NCU ?= sudo /usr/local/cuda/bin/ncu
 MODE ?= skeleton
 NVCCFLAGS = -arch=$(ARCH) -lineinfo -O2 -Xptxas -v -Icommon
 
@@ -43,7 +46,7 @@ check: $(BIN)
 	$(SAN) --tool synccheck ./$(BIN)
 
 prof: $(BIN)
-	ncu $(NCU_ARGS) ./$(BIN)
+	$(NCU) $(NCU_ARGS) ./$(BIN)
 
 else
 

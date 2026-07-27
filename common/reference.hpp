@@ -73,6 +73,19 @@ inline void ref_group_incl_scan(const float* a, float* out, int n) {
   ref_seg_incl_scan(a, out, n, 32);
 }
 
+// Sliding-window sum: out[i] = a[i] + a[i+1] + ... + a[i+w-1], for i in
+// [0, n). `a` must therefore hold n + w - 1 elements -- the trailing w - 1 are
+// the halo the last window reaches into, not outputs of their own. One double
+// accumulator per window, so the reference is more accurate than any float
+// association the kernel picks.
+inline void ref_window_sum(const float* a, float* out, int n, int w) {
+  for (int i = 0; i < n; i++) {
+    double acc = 0.0;
+    for (int k = 0; k < w; k++) acc += (double)a[i + k];
+    out[i] = (float)acc;
+  }
+}
+
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
 // expression is character-identical to the kernel's so both round the same
 // way; the clamp keeps a value on or past the top edge inside the array.
