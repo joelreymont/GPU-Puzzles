@@ -1,11 +1,19 @@
 #pragma once
 
+#include <algorithm>
+
 // CPU references. Double accumulators: the reference must be more accurate
 // than the kernel under test, not equally sloppy.
 
 inline float ref_dot(const float* a, const float* b, int n) {
   double acc = 0.0;
   for (int i = 0; i < n; i++) acc += (double)a[i] * (double)b[i];
+  return (float)acc;
+}
+
+inline float ref_sum(const float* a, int n) {
+  double acc = 0.0;
+  for (int i = 0; i < n; i++) acc += (double)a[i];
   return (float)acc;
 }
 
@@ -47,14 +55,33 @@ inline void ref_group_sum_all(const float* a, float* out, int n) {
   }
 }
 
-// Inclusive prefix sum restarted at every aligned 32-element group boundary.
-inline void ref_group_incl_scan(const float* a, float* out, int n) {
-  for (int base = 0; base < n; base += 32) {
-    int end = (base + 32 < n) ? base + 32 : n;
+// Inclusive prefix sum restarted at every aligned `seg`-element boundary.
+// seg = 32 is the warp scan (puzzle 26); seg = TPB is the block scan (27).
+inline void ref_seg_incl_scan(const float* a, float* out, int n, int seg) {
+  for (int base = 0; base < n; base += seg) {
+    int end = (base + seg < n) ? base + seg : n;
     double acc = 0.0;
     for (int i = base; i < end; i++) {
       acc += (double)a[i];
       out[i] = (float)acc;
     }
+  }
+}
+
+// Inclusive prefix sum restarted at every aligned 32-element group boundary.
+inline void ref_group_incl_scan(const float* a, float* out, int n) {
+  ref_seg_incl_scan(a, out, n, 32);
+}
+
+// Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
+// expression is character-identical to the kernel's so both round the same
+// way; the clamp keeps a value on or past the top edge inside the array.
+inline void ref_hist(const float* a, int* hist, int nbins, int n) {
+  for (int k = 0; k < nbins; k++) hist[k] = 0;
+  for (int i = 0; i < n; i++) {
+    float v = a[i];
+    int b = (int)((v + 1.0f) * 0.5f * nbins);
+    b = std::min(std::max(b, 0), nbins - 1);
+    hist[b]++;
   }
 }
