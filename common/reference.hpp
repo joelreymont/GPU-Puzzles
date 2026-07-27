@@ -156,6 +156,22 @@ inline void ref_gemm(const float* a, const float* b, float* c, int M, int N,
   }
 }
 
+// Shift by one block within a cluster: out[i] = a[i] + a[i + tpb], where the
+// second term exists only when a[i + tpb] belongs to a block of the SAME
+// cluster of `cluster` blocks of `tpb` threads. Element i sits in block
+// i / tpb, which is rank (i / tpb) % cluster; the last rank has no successor
+// inside its cluster, and the tail of the array has no successor at all. Both
+// cases contribute 0. One float add per element in the same order as the
+// kernel, so no accumulator is involved and nothing needs promoting.
+inline void ref_cluster_shift(const float* a, float* out, int n, int tpb,
+                              int cluster) {
+  for (int i = 0; i < n; i++) {
+    const bool has_next =
+        ((i / tpb) % cluster != cluster - 1) && (i + tpb < n);
+    out[i] = a[i] + (has_next ? a[i + tpb] : 0.0f);
+  }
+}
+
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
 // expression is character-identical to the kernel's so both round the same
 // way; the clamp keeps a value on or past the top edge inside the array.
