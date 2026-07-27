@@ -124,6 +124,15 @@ inline void ref_poly64(const float* a, float* out, int n) {
   }
 }
 
+// Out-of-place transpose of a rows x cols row-major matrix into a cols x rows
+// row-major matrix. No arithmetic happens: every output is a bit-exact copy of
+// exactly one input, so this reference is not an approximation of the kernel's
+// result, it IS the kernel's result, and the comparison tolerance is zero.
+inline void ref_transpose(const float* a, float* out, int rows, int cols) {
+  for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++) out[c * rows + r] = a[r * cols + c];
+}
+
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
 // expression is character-identical to the kernel's so both round the same
 // way; the clamp keeps a value on or past the top edge inside the array.
