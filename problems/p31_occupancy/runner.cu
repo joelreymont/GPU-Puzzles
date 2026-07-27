@@ -1,6 +1,9 @@
 #include "puzzle_utils.cuh"
 #include "reference.hpp"
 
+#include <algorithm>
+#include <vector>
+
 extern __global__ void PolyOne(const float* a, float* out, int n);
 extern __global__ void PolyFour(const float* a, float* out, int n);
 extern __global__ void SmemHog(const float* a, float* out, int n);
@@ -12,19 +15,99 @@ extern __global__ void SmemHog(const float* a, float* out, int n);
 // of 256 threads fit on an SM is an integer division of fixed hardware
 // budgets, and cudaOccupancyMaxActiveBlocksPerMultiprocessor computes it from
 // the binary. Same answer every run, on every machine of this model, whether
-// or not anything is instrumenting it. No margin, no tolerance, no clock.
+// or not anything is instrumenting it. No margin, no tolerance, no clock, no
+// gate -- it is asserted on every run, including instrumented ones.
 //
-// occupancy_not_predictive is a wall-clock measurement, and this box is a
-// shared-memory SoC: the GPU and the CPUs sit behind the same LPDDR5X. On an
-// idle machine PolyOne/PolyFour measures 1.28x, and in the cleanest windows
-// 1.49x. Let anything else run -- a build, another agent, even a 10 Hz
-// nvidia-smi poll -- and both kernels inflate, both go memory-bound, and the
-// ratio compresses toward 1.0; the lowest whole-run value in ~80 measurements
-// on this box was 1.052. So MARGIN sits below that floor rather than at half
-// the effect. The assert's job is to never lie; the size of the effect is
-// printed on the line above it either way, and the whole measured distribution
-// is in solutions/p31_occupancy/SOLUTION.md.
+// occupancy_not_predictive is a wall-clock measurement, and everything below
+// exists because of that difference.
+//
+// MARGIN is a floor on the PolyOne/PolyFour effect, not a description of it.
+// What it is a floor on is the PAIRED per-rep median (see bench_all and
+// paired_ratio) taken over the quietest window of the run (see
+// quietest_reps), behind the QUIET_GELEM gate.
+//
+// Measured with that estimator over 69 runs on this box, spanning everything
+// from a settled machine to three GPU bandwidth hogs plus 16 CPU memory
+// streamers plus three concurrent copies of this binary. On a quiet box the
+// ratio is 1.28-1.43. Under load it falls, and it falls together with
+// PolyFour's absolute throughput -- which is what the gate below reads.
+//
+// Over those 69 runs, the floor across every run the gate ADMITS is 1.1066.
+// MARGIN is 1.05, which sits 0.057 below that floor and still decisively
+// rejects what this assert exists to catch: a PolyFour with no per-thread
+// amortisation measures ~1.00, and the worst gated-out run measured 0.9913.
+//
+// 1.10 was tried and is NOT defensible here, which is worth recording because
+// the paired estimator is otherwise so much steadier than what it replaced. Per
+// run it is steadier; but its coupling to the gate is loose near the threshold,
+// so the gated-in floor is 1.1066 and a 1.10 margin would clear it by 0.0066 --
+// one sample from flaking. Buying headroom by raising the gate does not work
+// either: 110 Gelem/s only lifts the floor to 1.1249 and declines 48 % of runs
+// instead of 33 %. The distribution supports 1.05 and not more.
+//
+// For the record of what this replaced. The first version of this runner took
+// the ratio of each kernel's fastest rep across separately-timed reps. That is
+// the right estimator when the effect is a large multiple, and the wrong one
+// at 28 %: two minima drawn from different machine states swamp it. It FAILed
+// 3 of 9 full-suite runs, twice with the ratio outright inverted (0.899x,
+// 1.000x) on a box that reported itself idle. The paired median never inverted
+// once in 69 runs, including under a load that dropped the SM clock to 904 MHz.
 constexpr float MARGIN = 1.05f;
+
+// The gate MARGIN sits behind, and the honest answer to a problem no estimator
+// can solve.
+//
+// This is a shared-memory SoC: one LPDDR5X behind both the GPU and the CPUs.
+// When something else on the box takes a large share of it, PolyOne and
+// PolyFour stop being limited by their own exposed load latency and start
+// being limited by the contention -- and the ratio between them collapses
+// toward 1.0. That is physics, not noise. Under an external bottleneck the
+// per-thread amortisation genuinely stops paying, because the thing it
+// amortises is no longer the constraint. No estimator recovers an effect that
+// is not present, and a margin low enough to survive the contended floor would
+// not be a claim worth making.
+//
+// So the runner checks whether it got a measurement before it asserts anything
+// about one. PolyFour is the reference because it is the kernel with the least
+// slack of its own: on a quiet box it evaluates the polynomial at 139.5 billion
+// elements per second, reproducible to 0.1 % run after run.
+//
+// Where to put the gate is a measurement, not a rule of thumb. Across the 69
+// runs, sorted by PolyFour's quiet-window throughput:
+//
+//   gate  admitted  skipped  ratio floor over admitted runs
+//     90     56/69      19%  1.0473   <- admits runs that would FAIL
+//     95     52/69      25%  1.0473   <- same
+//    100     46/69      33%  1.1066
+//    110     36/69      48%  1.1249
+//    120     28/69      59%  1.1249
+//
+// 100 Gelem/s is the lowest threshold at which no admitted run falls under
+// MARGIN, and every step above it buys almost no floor for a lot of SKIPs. It
+// is 72 % of the 139.5 Gelem/s this kernel reaches on a settled box.
+//
+// The gate earns its keep, and the numbers say how much: over 25 consecutive
+// runs in this box's ordinary working state -- no synthetic load, just the
+// other agents that live here -- 11 fell below the gate, and SIX of those 11
+// had ratios under MARGIN. Without the gate those six are FAILs on a machine
+// where nothing is wrong with the kernels. With it they are SKIPs.
+//
+// What an unmeasurable run looks like is worth knowing, because it is not
+// subtle: PolyFour at 89.2 Gelem/s, the asserted ratio down to 1.1654, and the
+// smem_hog/poly_one ratio -- an effect with nothing to do with this assert --
+// flattened from its usual 1.19-1.22 to 1.0118. Every effect in the file
+// disappears at once. That is why the gate reads a throughput rather than
+// trying to sanity-check the ratio it is guarding.
+//
+// One thing the gate is NOT is a DVFS check. The SM clock, measured by the
+// device itself below, is a flat 2530-2560 MHz on runs that come out anywhere
+// from 63 to 139 Gelem/s. What varies is how much of the LPDDR5X this process
+// can get, and nothing on the GPU side reports that.
+//
+// Below the gate the runner prints SKIP with the numbers and does not assert.
+// It does not FAIL, because a busy box is not a wrong kernel and a FAIL has to
+// mean the puzzle's claim is false. It does not pass quietly either.
+constexpr double QUIET_GELEM = 100.0;
 
 struct Occ {
   int regs;
@@ -53,8 +136,44 @@ static Occ occupancy_of(K kern, int tpb, const cudaDeviceProp& prop) {
   return o;
 }
 
+// Measures the SM clock, in MHz, by spinning a single warp for a known number
+// of SM cycles and timing it on the wall clock.
+//
+// This is not decoration. nvidia-smi on this box reports `clocks.sm` as
+// 208 MHz even while the GPU is at 91 % utilisation drawing 56 W, so the only
+// way to know what clock a measurement was taken at is to ask the device
+// itself. One warp spinning on clock64() draws almost no power, so this also
+// wakes the GPU off its idle clock before anything downstream of it is timed.
+__global__ void SpinCycles(long long cycles, long long* out) {
+  long long d = 0;
+  const long long t0 = clock64();
+  do {
+    d = clock64() - t0;
+  } while (d < cycles);
+  if (blockIdx.x == 0 && threadIdx.x == 0) *out = d;
+}
+
+static float measure_sm_mhz(long long* d_scratch) {
+  constexpr long long CYCLES = 20000000;  // ~8 ms at 2.5 GHz
+  GpuTimer timer;
+  timer.start();
+  SpinCycles<<<1, 32>>>(CYCLES, d_scratch);
+  const float ms = timer.stop_ms();
+  CHECK_LAUNCH();
+  return (float)CYCLES / (ms * 1000.0f);
+}
+
+// One timed kernel: a name, a handle, and its grid. All three take the same
+// argument pack; only the grid differs, because PolyFour covers four elements
+// per thread.
+struct Job {
+  const char* name;
+  const void* kern;
+  dim3 grid;
+};
+
 // All three kernels are timed together: one rep of each in turn, repeated, and
-// each kernel keeps its own fastest rep.
+// every individual sample is kept.
 //
 // Interleaving is not cosmetic. Timing every rep of one kernel and then every
 // rep of the next lets a drift in machine state land entirely on one of them;
@@ -62,24 +181,21 @@ static Occ occupancy_of(K kern, int tpb, const cudaDeviceProp& prop) {
 // always against whichever kernel runs last. One rep of each in turn gives
 // every kernel the same distribution of machine states.
 //
-// The fastest rep, not the mean, is the estimate. These kernels run in 15-25
-// us, and contention only ever makes a measurement slower -- never faster --
-// so the minimum is the observation least contaminated by whatever else the
-// machine was doing. An average folds that contamination straight into the
-// number the assert reads.
+// Keeping every sample rather than only the minimum is what lets the caller
+// form PAIRED ratios -- PolyOne and PolyFour as measured inside the same rep,
+// a few hundred microseconds apart -- and take the median of those. See
+// MARGIN for why that replaced the ratio of minima this runner used first.
 //
 // Launched through cudaLaunchKernel rather than <<<>>> so the loop is written
 // once: CUDA does not allow <<<>>> through a function pointer, but the
 // host-side stub address is a perfectly good kernel handle.
-static void bench_all(const void* const* kerns, const int* blocks, int nk,
-                      int tpb, const float* d_a, float* d_out, int n,
-                      int warmup, int iters, int reps, float* ms_out) {
-  void* args[] = {(void*)&d_a, (void*)&d_out, (void*)&n};
+static void bench_all(const Job* jobs, int nk, int tpb, void** args, int warmup,
+                      int iters, int reps, std::vector<float>* samples) {
   for (int k = 0; k < nk; k++) {
-    ms_out[k] = -1.0f;
+    samples[k].clear();
     for (int i = 0; i < warmup; i++) {
       CHECK_CUDA(
-          cudaLaunchKernel(kerns[k], dim3(blocks[k]), dim3(tpb), args, 0, 0));
+          cudaLaunchKernel(jobs[k].kern, jobs[k].grid, dim3(tpb), args, 0, 0));
     }
   }
   CHECK_LAUNCH();
@@ -90,13 +206,70 @@ static void bench_all(const void* const* kerns, const int* blocks, int nk,
       timer.start();
       for (int i = 0; i < iters; i++) {
         CHECK_CUDA(
-            cudaLaunchKernel(kerns[k], dim3(blocks[k]), dim3(tpb), args, 0, 0));
+            cudaLaunchKernel(jobs[k].kern, jobs[k].grid, dim3(tpb), args, 0, 0));
       }
-      const float ms = timer.stop_ms() / iters;
+      samples[k].push_back(timer.stop_ms() / iters);
       CHECK_CUDA(cudaGetLastError());
-      if (ms_out[k] < 0.0f || ms < ms_out[k]) ms_out[k] = ms;
     }
   }
+}
+
+// Ranks the reps by how quiet the machine was during each one -- the sum of
+// the three kernels' samples in that rep -- and returns the indices of the
+// quietest `keep`, in rep order.
+//
+// Contention only ever makes a measurement slower, never faster, so the reps
+// with the smallest total are the ones least contaminated by whatever else the
+// box was doing. This is the same principle the earlier timing puzzles apply
+// when they keep each kernel's fastest rep, moved up one level: the unit
+// selected is the matched TRIPLE, so the three kernels are still being
+// compared against each other inside a single machine state rather than each
+// against its own best moment.
+//
+// It cannot flatter a slow kernel. The ranking is on the rep total, so a
+// kernel that is uniformly slow is slow in every rep, quiet or not, and its
+// ratio is unchanged. What the ranking removes is the rep in which some other
+// process took the memory system away from all three at once.
+static std::vector<int> quietest_reps(const std::vector<float>* samples, int nk,
+                                      int reps, int keep) {
+  std::vector<int> idx(reps);
+  for (int r = 0; r < reps; r++) idx[r] = r;
+  std::sort(idx.begin(), idx.end(), [&](int x, int y) {
+    float sx = 0.0f, sy = 0.0f;
+    for (int k = 0; k < nk; k++) {
+      sx += samples[k][x];
+      sy += samples[k][y];
+    }
+    return sx < sy;
+  });
+  idx.resize(keep);
+  std::sort(idx.begin(), idx.end());
+  return idx;
+}
+
+// Median of one kernel's samples over the given reps.
+static float median_over(const std::vector<float>& v,
+                         const std::vector<int>& reps) {
+  std::vector<float> s;
+  s.reserve(reps.size());
+  for (int r : reps) s.push_back(v[r]);
+  std::sort(s.begin(), s.end());
+  return s[s.size() / 2];
+}
+
+// Median of the per-rep ratio of two kernels over the given reps. `lo` and
+// `hi` come back as the quartiles, so the caller can print the spread the
+// median came out of.
+static float paired_ratio(const std::vector<float>& num,
+                          const std::vector<float>& den,
+                          const std::vector<int>& reps, float* lo, float* hi) {
+  const int n = (int)reps.size();
+  std::vector<float> r(n);
+  for (int i = 0; i < n; i++) r[i] = num[reps[i]] / den[reps[i]];
+  std::sort(r.begin(), r.end());
+  *lo = r[n / 4];
+  *hi = r[(3 * n) / 4];
+  return r[n / 2];
 }
 
 int main() {
@@ -123,7 +296,11 @@ int main() {
   const int BLOCKS_FOUR = cdiv(cdiv(n, ELEMS), TPB);
   const int WARMUP = 3;
   const int ITERS = 20;
-  const int REPS = 15;  // see bench_all(): the assert needs the best, not the mean
+  const int REPS = 201;
+  // How many of those reps the ratios are taken over: the quietest KEEP of the
+  // REPS, by total time across the three kernels. Odd, so the median is a
+  // measured sample rather than the average of two. See quietest_reps().
+  const int KEEP = 21;
   // 63 chained float FMAs against a double accumulator over character-
   // identical coefficients. The worst deviation measured over all 2000003
   // outputs on this box is 2.364e-7 relative (index 813587, want 4.03478), and
@@ -193,6 +370,9 @@ int main() {
   // unless both of them compute the same right answer. Every kernel owns every
   // output, so poison the buffer with 0xff (a NaN bit pattern) -- an output
   // that is never written is a FAIL, not a lucky zero.
+  //
+  // Nothing in this section is gated or skipped, ever. The gate below applies
+  // to one wall-clock assert; correctness is not a measurement of the machine.
   bool ok = true;
 
   CHECK_CUDA(cudaMemset(d_out, 0xff, n * sizeof(float)));
@@ -214,9 +394,9 @@ int main() {
   ok = compare("smem_hog", got, want, n, tol) && ok;
 
   // Pure resource arithmetic on the compiled kernels: it times nothing, it
-  // cannot be perturbed by an instrumented run, and it holds or fails
-  // identically under compute-sanitizer and under ncu. So it is checked
-  // whenever the kernels are correct.
+  // cannot be perturbed by an instrumented run or by a busy box, and it holds
+  // or fails identically under compute-sanitizer and under ncu. So it is
+  // checked whenever the kernels are correct, and it is never gated.
   if (ok) {
     if (hog.blocks < one.blocks) {
       printf("PASS smem_limits_occupancy (SmemHog %d blocks/SM < PolyOne %d,"
@@ -248,38 +428,96 @@ int main() {
            " and were verified above, and the occupancy table is exact"
            " regardless; only the wall-clock comparison is off.\n");
   } else {
-    const void* kerns[3] = {(const void*)PolyOne, (const void*)PolyFour,
-                            (const void*)SmemHog};
-    const int blocks[3] = {BLOCKS_ONE, BLOCKS_FOUR, BLOCKS_ONE};
-    float ms[3];
-    bench_all(kerns, blocks, 3, TPB, d_a, d_out, n, WARMUP, ITERS, REPS, ms);
-    printf("# timing: fastest of %d interleaved reps of (%d warmup + %d timed"
-           " iterations); all three evaluate all %d polynomials\n",
+    long long* d_cycles;
+    CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(long long)));
+    const float mhz_before = measure_sm_mhz(d_cycles);
+
+    // Order matters by one place: PolyOne and PolyFour are adjacent, so the
+    // asserted ratio is formed from samples taken back to back.
+    const Job jobs[3] = {
+        {"PolyOne", (const void*)PolyOne, dim3(BLOCKS_ONE)},
+        {"PolyFour", (const void*)PolyFour, dim3(BLOCKS_FOUR)},
+        {"SmemHog", (const void*)SmemHog, dim3(BLOCKS_ONE)},
+    };
+    void* args[] = {(void*)&d_a, (void*)&d_out, (void*)&n};
+    std::vector<float> samples[3];
+    bench_all(jobs, 3, TPB, args, WARMUP, ITERS, REPS, samples);
+    const float mhz_after = measure_sm_mhz(d_cycles);
+    CHECK_CUDA(cudaFree(d_cycles));
+
+    printf("# SM clock: %.0f MHz before the timed section, %.0f MHz after"
+           " (nvidia-smi reports 208 MHz throughout; it is wrong)\n",
+           mhz_before, mhz_after);
+    printf("# timing: %d interleaved reps of (%d warmup + %d timed iterations);"
+           " all three evaluate all %d polynomials\n",
            REPS, WARMUP, ITERS, n);
     printf("# %-10s %9s %12s %11s\n", "kernel", "best ms", "ns/element",
            "occupancy");
     for (int k = 0; k < 3; k++) {
-      printf("  %-10s %9.4f %12.5f %10.1f%%\n", names[k], ms[k],
-             ms[k] * 1e6 / n, 100.0 * occs[k]->frac);
+      const float best =
+          *std::min_element(samples[k].begin(), samples[k].end());
+      printf("  %-10s %9.4f %12.5f %10.1f%%\n", jobs[k].name, best,
+             best * 1e6 / n, 100.0 * occs[k]->frac);
     }
 
-    const float ratio = ms[0] / ms[1];
-    if (ratio >= MARGIN) {
-      printf("PASS occupancy_not_predictive (poly_one / poly_four = %.3fx >="
+    float rlo = 0.0f, rhi = 0.0f, hlo = 0.0f, hhi = 0.0f;
+    const std::vector<int> quiet = quietest_reps(samples, 3, REPS, KEEP);
+    const float ratio = paired_ratio(samples[0], samples[1], quiet, &rlo, &rhi);
+    const float r_hog = paired_ratio(samples[2], samples[0], quiet, &hlo, &hhi);
+    printf("# paired per-rep ratios, median over the %d quietest of %d reps:\n",
+           KEEP, REPS);
+    printf("#   poly_one / poly_four = %.4fx  [p25 %.4f, p75 %.4f]  asserted:"
+           " two kernels at the SAME occupancy\n",
+           ratio, rlo, rhi);
+    printf("#   smem_hog / poly_one  = %.4fx  [p25 %.4f, p75 %.4f]  reported"
+           " only: what the lost third of the occupancy actually costs\n",
+           r_hog, hlo, hhi);
+
+    // How fast the quiet window actually ran, and the gate on whether anything
+    // above is a measurement of this GPU rather than of the rest of the box.
+    // See QUIET_GELEM.
+    const float quiet_ms = median_over(samples[1], quiet);
+    const double quiet_gelem = n / (quiet_ms * 1e6);
+    printf("# quiet-window PolyFour: %.5f ms = %.1f Gelem/s (gate: >= %.0f"
+           " Gelem/s)\n",
+           quiet_ms, quiet_gelem, QUIET_GELEM);
+
+    const bool measurable = quiet_gelem >= QUIET_GELEM;
+
+    if (!measurable) {
+      printf("SKIP occupancy_not_predictive: this run never got a quiet"
+             " window. The quietest %d of %d reps still ran PolyFour at %.1f"
+             " Gelem/s, under the %.0f Gelem/s gate and well under the 139.5"
+             " Gelem/s it reaches on a quiet box, so something else had the"
+             " memory system for the whole measurement.\n",
+             KEEP, REPS, quiet_gelem, QUIET_GELEM);
+      printf("SKIP   the ratios above are printed anyway and are real"
+             " measurements -- of a saturated machine. Under external load"
+             " both kernels become bound by the contention rather than by"
+             " their own exposed load latency, and the ratio collapses toward"
+             " 1.0; that is physics, not an estimator problem, and no amount"
+             " of rep selection recovers it. Correctness and"
+             " smem_limits_occupancy above are unaffected and were fully"
+             " checked. Re-run on an idle box.\n");
+    } else if (ratio >= MARGIN) {
+      printf("PASS occupancy_not_predictive (poly_one / poly_four = %.4fx >="
              " %.2fx, at %.1f%% vs %.1f%% occupancy)\n",
              ratio, MARGIN, 100.0 * one.frac, 100.0 * four.frac);
     } else {
-      printf("FAIL occupancy_not_predictive: poly_one / poly_four = %.3fx,"
+      printf("FAIL occupancy_not_predictive: poly_one / poly_four = %.4fx,"
              " expected >= %.2fx\n",
              ratio, MARGIN);
       printf("FAIL   PolyFour does the same total arithmetic in a quarter of"
              " the threads, %d elements per thread instead of one; it should be"
              " decisively faster per element, and it was not\n",
              ELEMS);
-      printf("FAIL   a ratio below the margin usually means another process is"
-             " loading this shared-memory SoC -- the GPU and the CPUs share one"
-             " LPDDR5X, and under contention both kernels go memory-bound and"
-             " converge. Re-run on an idle box.\n");
+      printf("FAIL   this is a gated-in run -- PolyFour cleared %.1f Gelem/s in"
+             " its quiet window, so external load is NOT the explanation and"
+             " this FAIL means the puzzle's claim did not hold. Check that"
+             " PolyFour really covers %d elements per thread strided by"
+             " gridDim.x * blockDim.x, and that the runner launched it on"
+             " cdiv(n, %d) threads rather than n.\n",
+             quiet_gelem, ELEMS, ELEMS);
       printf("FAIL   (running under compute-sanitizer or ncu? set"
              " P31_SKIP_TIMING=1 -- instrumented wall-clock time is not a"
              " measurement of this machine)\n");

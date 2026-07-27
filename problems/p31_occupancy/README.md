@@ -171,7 +171,8 @@ make prof  P=31 MODE=solution    # Occupancy + SpeedOfLight + WarpStateStats
 ```
 
 Expected from `make run`: the occupancy table, three `PASS` lines, `PASS
-smem_limits_occupancy`, a timing table, and `PASS occupancy_not_predictive`.
+smem_limits_occupancy`, a timing table, the paired ratio lines, and `PASS
+occupancy_not_predictive`.
 
 The occupancy table prints **even when your kernels are wrong** — it is the
 instrument, not a diagnostic. The two relationship checks are guarded
@@ -180,6 +181,34 @@ compiled binary and is asserted on every run including instrumented ones,
 while the timing check is skipped when `P31_SKIP_TIMING` is set (see
 `problems/p31_occupancy/prof.mk`, which sets it for the sanitizer runs). Under
 `compute-sanitizer` or `ncu` a wall clock measures the tool.
+
+### How the timing number is formed, and why it is not a minimum
+
+Worth reading before you trust — or argue with — the ratio, because the
+estimator is doing real work:
+
+- All three kernels are timed **inside the same rep**, a few hundred
+  microseconds apart, and the ratio is formed *within* the rep. This box is a
+  shared-memory SoC — one LPDDR5X behind the GPU and the CPUs — so an
+  unrelated process slows both kernels of a pair at once, and a ratio formed
+  from adjacent samples is largely indifferent to that. A ratio formed from two
+  minima drawn from *different* machine states is not: that estimator inverted
+  on this box, reporting `PolyFour` slower than `PolyOne`, on runs where the
+  paired median read 1.20×.
+- The 201 reps are ranked by their three-kernel total and the **quietest 21**
+  are kept; the estimate is the median of those. Contention only ever makes a
+  measurement slower, so the cheapest reps are the least contaminated ones. The
+  ranking is on the rep *total*, so it cannot flatter one kernel — a kernel
+  that is uniformly slow is slow in every rep.
+- The SM clock is measured **by the GPU**, with one warp spinning on
+  `clock64()`. `nvidia-smi` reports 208 MHz on this box while the device is
+  actually at ~2540 MHz, so it is not usable as a check on whether your
+  measurement was taken at a sane clock.
+- If the quiet window still fails an absolute throughput floor, the runner
+  prints **`SKIP`** and exits 0 rather than failing. Under enough external load
+  every effect in this puzzle genuinely disappears, and that is a fact about
+  your box, not about your kernel. A `FAIL` from this runner always means the
+  claim was false, never that the machine was busy.
 
 > `ncu` needs permission to read the GPU's performance counters, which on this
 > box is admin-only (`RmProfilingAdminOnly: 1`). If `make prof` reports

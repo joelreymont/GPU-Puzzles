@@ -122,14 +122,22 @@ answered.
 ## 3. What the runner measured
 
 ```
-# timing: fastest of 15 interleaved reps of (3 warmup + 20 timed iterations)
+# SM clock: 2530 MHz before the timed section, 2539 MHz after (nvidia-smi reports 208 MHz throughout; it is wrong)
+# timing: 201 interleaved reps of (3 warmup + 20 timed iterations)
 # kernel       best ms   ns/element   occupancy
   PolyOne       0.0184      0.00921      100.0%
   PolyFour      0.0143      0.00716      100.0%
   SmemHog       0.0224      0.01121       66.7%
+# paired per-rep ratios, median over the 21 quietest of 201 reps:
+#   poly_one / poly_four = 1.2853x  [p25 1.2841, p75 1.2874]  asserted
+#   smem_hog / poly_one  = 1.2198x  [p25 1.2176, p75 1.2219]  reported only
+# quiet-window PolyFour: 0.01434 ms = 139.5 Gelem/s (gate: >= 100 Gelem/s)
 PASS smem_limits_occupancy (SmemHog 4 blocks/SM < PolyOne 6, 66.7% vs 100.0%)
-PASS occupancy_not_predictive (poly_one / poly_four = 1.286x >= 1.05x, at 100.0% vs 100.0% occupancy)
+PASS occupancy_not_predictive (poly_one / poly_four = 1.2853x >= 1.05x, at 100.0% vs 100.0% occupancy)
 ```
+
+The estimator behind those two ratio lines is the subject of section 9.3; it is
+not the ratio of each kernel's fastest rep, and the reason is measured.
 
 Two rows of that table have identical occupancy and are 1.29× apart. One row
 has lower occupancy and is 1.22× slower. Both facts are real. Sections 4 and 5
@@ -433,35 +441,95 @@ each other, as three implementations of the same arithmetic should be.
    API to the block; the achieved numbers on kernels this short are not worth
    quoting, and none of the conclusions above rests on one.
 
-3. **The timing assert is measuring a shared SoC.** GB10 is not a discrete
-   card: the GPU and the CPUs are behind the same LPDDR5X. On an idle machine
-   `PolyOne`/`PolyFour` is extremely reproducible — 1.279, 1.280, 1.283, 1.284,
-   1.285, 1.286, 1.287, 1.288 across consecutive runs, a spread under 1 %, with
-   the cleanest windows reaching 1.49×. Let anything else run and both kernels
-   inflate together, both go memory-bound, and the ratio compresses: across
-   ~80 whole-run measurements taken while this box was also running builds and
-   other agents, the distribution has a mode at **1.28**, a clean maximum of
-   **1.49**, and a contended tail reaching **1.052**. A 10 Hz `nvidia-smi`
-   poll running alongside is enough to drag it to 1.055.
+3. **The timing assert is measuring a shared SoC, and the estimator is the
+   whole story.** GB10 is not a discrete card: the GPU and the CPUs are behind
+   the same LPDDR5X. Anything else running on the box slows both kernels, and
+   how much that corrupts the *ratio* turns out to depend entirely on how the
+   ratio is formed.
 
-   `MARGIN` is therefore **1.05**, below the entire observed distribution,
-   rather than the ~1.14 that "half the effect" would suggest. The measured
-   ratio is printed on the `PASS` line every run, so the *size* of the effect
-   is always visible; the assert only has to be true. When it does fire, the
-   FAIL text names box contention as the first thing to check, because it is
-   overwhelmingly the likeliest cause.
+   **The estimator that failed.** The first version of this runner timed each
+   kernel's reps and took the ratio of the two minima. That is the right
+   estimator when the effect is a large multiple — puzzle 32's is 1.6×,
+   puzzle 33's is 4× — and the wrong one at 28 %, because the two minima are
+   drawn from different machine states and the difference between those states
+   is bigger than the effect. It showed: **that estimator FAILed 3 of 9
+   full-suite runs**, twice with the ratio outright *inverted* (0.899×, 1.000×)
+   on a box that reported itself idle.
 
-   Two things were tried and did not fix this, both worth recording as dead
-   ends: a wall-clock ramp of 25–250 ms before timing (the SM clock is a stable
-   2.55 GHz under sustained load either way — this is contention, not DVFS
-   warm-up), and raising the rep count to 25 or 50 (contention persists for
-   whole runs, so more reps inside one contended run buys nothing). What *did*
-   help is interleaving: timing all reps of one kernel and then all reps of the
-   next biases the ratio by ~0.05 against whichever kernel goes last, and one
-   rep of each in turn removes it. That is why `bench_all` is shaped the way it
-   is.
+   **The estimator that works.** All three kernels are timed inside the same
+   rep, a few hundred microseconds apart; the ratio is formed *within* each rep;
+   the reps are ranked by their three-kernel total and the quietest 21 of 201
+   are kept; the estimate is the median of those 21 paired ratios. Contention
+   slows both kernels of a pair nearly proportionally, and a ratio is
+   indifferent to that. Measured over 69 runs spanning a settled box to three
+   GPU bandwidth hogs plus 16 CPU memory streamers plus three concurrent copies
+   of the binary: on a quiet box the ratio is **1.28 – 1.43**; under load it
+   falls, together with `PolyFour`'s absolute throughput. **It never inverted
+   once in 69 runs**, including under a load that dragged the SM clock from
+   2535 MHz to 904 MHz — where the old estimator produced 0.899×.
 
-4. **`dram__*` counters do not exist on GB10**, as puzzle 30 found — this SoC
+   **The gate.** Under enough external load the effect genuinely disappears, so
+   the runner checks whether it got a measurement before asserting anything
+   about one. It gates on `PolyFour`'s quiet-window throughput; below the
+   threshold it prints `SKIP` and exits 0, because a busy box is not a wrong
+   kernel and a `FAIL` has to mean the puzzle's claim is false. Where to put the
+   threshold is itself a measurement:
+
+   | gate | admitted | skipped | ratio floor over admitted runs |
+   |---|---|---|---|
+   | 90 Gelem/s | 56/69 | 19 % | 1.0473 — admits runs that would FAIL |
+   | 95 | 52/69 | 25 % | 1.0473 — same |
+   | **100** | **46/69** | **33 %** | **1.1066** |
+   | 110 | 36/69 | 48 % | 1.1249 |
+   | 120 | 28/69 | 59 % | 1.1249 |
+
+   **100 Gelem/s** — 72 % of the 139.5 Gelem/s roof — is the lowest threshold at
+   which no admitted run falls under `MARGIN`, and every step above it buys
+   almost no floor for a lot of `SKIP`s.
+
+   **`MARGIN` is therefore 1.05**, 0.057 below the 1.1066 gated-in floor. 1.10
+   was tried and is not defensible: it would clear that floor by 0.0066, one
+   sample from flaking, and raising the gate to buy headroom only reaches 1.1249
+   while declining half of all runs. The paired estimator is far steadier *per
+   run* than what it replaced, but its coupling to the gate is loose near the
+   threshold, and the distribution supports 1.05 and not more. The measured
+   ratio is printed every run either way, so the size of the effect is always
+   visible; the assert only has to be true.
+
+   **What the gate is worth, measured.** Over 25 consecutive runs in this box's
+   ordinary working state — no synthetic load, just the other agents that live
+   here — 11 fell below the gate and **6 of those 11 had ratios under `MARGIN`**.
+   Without the gate those six are `FAIL`s on a machine where nothing is wrong
+   with the kernels. Final verification with both constants in place: 20
+   consecutive runs, **15 PASS, 5 SKIP, 0 FAIL**, every exit code 0, lowest
+   gated-in ratio 1.1208.
+
+   **What an unmeasurable run looks like** is not subtle, which is why the gate
+   reads a throughput rather than trying to sanity-check the ratio it guards:
+   `PolyFour` at 89.2 Gelem/s, the asserted ratio down to 1.1654, and
+   `smem_hog`/`poly_one` — an effect with nothing to do with that assert —
+   flattened from its usual 1.19–1.22 to **1.0118**. Every effect in the file
+   disappears at once.
+
+   Two things were tried and did **not** help, recorded as dead ends: a
+   wall-clock ramp of 25–250 ms before timing, and raising the rep count under
+   the old estimator to 25 or 50 (contention persists for whole runs, so more
+   reps inside one contended run buys nothing). What did help, besides the
+   paired median, is interleaving — timing all reps of one kernel and then all
+   reps of the next biases the ratio by ~0.05 against whichever kernel goes
+   last.
+
+4. **`nvidia-smi` cannot be used to tell whether this box is busy.** It reports
+   `clocks.sm` as 208 MHz and pstate P8 throughout a run that the in-kernel
+   `clock64()` measurement times at **2530–2559 MHz**, and it reported the GPU
+   idle during runs that were demonstrably contended. The runner therefore
+   measures the SM clock itself, with one warp spinning on `clock64()` for a
+   known cycle count, and prints it before and after the timed section. Under
+   the synthetic load campaign that measurement read 904–2136 MHz, which is how
+   the DVFS component of the contention was separated from the bandwidth
+   component at all.
+
+5. **`dram__*` counters do not exist on GB10**, as puzzle 30 found — this SoC
    does not expose DRAM-side performance counters, so `lts__*` is the deepest
    measurable level and every DRAM claim in section 7 rests on the behavioural
    evidence of the sweep rather than on a counter.
