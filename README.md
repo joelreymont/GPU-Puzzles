@@ -1,6 +1,18 @@
 # GPU Puzzles
 - by [Sasha Rush](http://rush-nlp.com) - [srush_nlp](https://twitter.com/srush_nlp)
 
+> **This fork** extends [dshah3/GPU-Puzzles](https://github.com/dshah3/GPU-Puzzles)
+> (the CUDA C port of [srush/GPU-Puzzles](https://github.com/srush/GPU-Puzzles))
+> with puzzles 24–35 covering warp primitives, block collectives, async copy,
+> synchronization, profiling, occupancy, bank conflicts, tensor cores, clusters,
+> and alignment — following the pedagogical outline of
+> [modular/mojo-gpu-puzzles](https://github.com/modular/mojo-gpu-puzzles)
+> (no code or prose copied). The original puzzles 1–14 are de-Colabbed into
+> `GPU_puzzlers_exec/` (`make test` there). New puzzles live in `problems/`,
+> `skeletons/`, `solutions/`; see the root `Makefile` (`make run P=24`).
+> Target hardware: NVIDIA DGX Spark (GB10, `sm_121`, CUDA 13). Apache-2.0
+> throughout, inherited from both upstreams.
+
 ![](https://github.com/srush/GPU-Puzzles/raw/main/cuda.png)
 
 GPU architectures are critical to machine learning, and seem to be

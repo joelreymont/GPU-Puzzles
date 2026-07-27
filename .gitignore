@@ -131,3 +131,4 @@ dmypy.json
 # CUDA build outputs
 GPU_puzzlers_exec/bin/
 build/
+common/caps.mk
