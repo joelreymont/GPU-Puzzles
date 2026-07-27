@@ -13,6 +13,52 @@
 > Target hardware: NVIDIA DGX Spark (GB10, `sm_121`, CUDA 13). Apache-2.0
 > throughout, inherited from both upstreams.
 
+## Working the puzzles (24–35)
+
+Each puzzle `NN` is three parallel trees sharing one immutable host harness:
+
+- `problems/pNN_*/README.md` — the puzzle statement. Start here.
+- `problems/pNN_*/runner.cu` — allocates, launches, verifies. **Never edit.**
+- `skeletons/pNN_*/kernel.cu` — **the file you edit.** Fill in the regions
+  between `/// BEGIN CODE HERE (approx N lines) ///` and `/// END CODE HERE ///`;
+  everything outside them is given.
+- `solutions/pNN_*/kernel.cu` — the verified reference. Some puzzles (30–32)
+  also have a `SOLUTION.md` with the measured profiler analysis — the puzzle
+  there is explaining the numbers, so read it only after forming your own answer.
+
+The loop:
+
+```bash
+make run P=24                 # build + run YOUR kernel (fails until you fill it in)
+make run P=24 MODE=solution   # the reference, to see the expected output
+make check P=24               # compute-sanitizer: memcheck + racecheck + synccheck
+make prof P=24                # ncu with that puzzle's metrics (sudo-wrapped; see below)
+make sync                     # skeletons and solutions still match outside fill-ins
+make test                     # every puzzle in solution mode, PASS/FAIL table
+```
+
+Work them in order — 24 → 35 builds warp → block → cluster and each README
+leans on the previous ones. A puzzle is done when `make run P=NN` prints all
+PASS and `make check P=NN` is clean.
+
+Notes for this box (DGX Spark):
+
+- First build generates `common/caps.mk` by running `scripts/probe_caps.cu` on
+  the GPU (it gates puzzle 34 on measured cluster support).
+- `make prof` runs `sudo /usr/local/cuda/bin/ncu` (driver restricts profiling;
+  a NOPASSWD sudoers rule for exactly that binary is expected).
+- Timing puzzles (30, 31, 35) assert measured performance relationships. Under
+  concurrent load on this shared-memory SoC they print `SKIP` with an
+  explanation instead of failing — correctness is always checked. Re-run idle
+  for the full result. Every performance number in the READMEs was measured
+  here; expect different numbers on other hardware.
+
+The original puzzles 1–14 live in `GPU_puzzlers_exec/` (edit `*_kernel.cu`,
+run `make test` in that directory). Everything below this line is the upstream
+NUMBA/Colab README, kept for lineage.
+
+---
+
 ![](https://github.com/srush/GPU-Puzzles/raw/main/cuda.png)
 
 GPU architectures are critical to machine learning, and seem to be
