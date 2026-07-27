@@ -107,6 +107,23 @@ inline void ref_stencil_steps(const float* a, float* out, int n, int steps) {
   for (int i = 0; i < n; i++) out[i] = (float)cur[i];
 }
 
+// Horner evaluation of the fixed 64-term polynomial p(x) = sum_k x^k / (k+1),
+// one output per input. The coefficient expression is character-identical to
+// the kernel's, so both round to the same float and the tolerance measures the
+// accumulation error alone; only the 63-step accumulation is promoted to
+// double, which is what makes this reference more accurate than the kernel
+// under test rather than equally sloppy.
+inline void ref_poly64(const float* a, float* out, int n) {
+  constexpr int TERMS = 64;
+  for (int i = 0; i < n; i++) {
+    const double x = (double)a[i];
+    double acc = (double)(1.0f / (float)TERMS);  // c_{TERMS-1}
+    for (int k = TERMS - 2; k >= 0; k--)
+      acc = acc * x + (double)(1.0f / (float)(k + 1));
+    out[i] = (float)acc;
+  }
+}
+
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
 // expression is character-identical to the kernel's so both round the same
 // way; the clamp keeps a value on or past the top edge inside the array.
