@@ -172,6 +172,33 @@ inline void ref_cluster_shift(const float* a, float* out, int n, int tpb,
   }
 }
 
+// saxpy: out[i] = s * a[i] + b[i]. Two flops per element and no accumulation,
+// so there is nothing to reassociate -- but there is still a rounding decision,
+// and this reference makes the more accurate one. The kernels compile
+// `s * a[i] + b[i]` to a single FFMA (nvcc contracts by default), which rounds
+// once; a float `s * a[i]` followed by a float `+ b[i]` would round twice.
+// Promoting to double reproduces the fused form exactly: the product of two
+// floats needs at most 48 significant bits and a double carries 53, so
+// `(double)s * (double)a[i]` is exact and the sum rounds once on the way back
+// to float, which is what FFMA does.
+inline void ref_saxpy(const float* a, const float* b, float* out, float s,
+                      int n) {
+  for (int i = 0; i < n; i++)
+    out[i] = (float)((double)s * (double)a[i] + (double)b[i]);
+}
+
+// The same arithmetic with the `a` operand read one element to the right:
+// out[i] = s * a[i + 1] + b[i], for i in [0, n). `a` must therefore hold n + 1
+// elements -- the extra one is the element the last output reaches for, not an
+// output of its own. `b` and `out` hold n. Nothing about the arithmetic changes;
+// the only difference is that every warp's `a` load now starts four bytes past
+// a 128-byte boundary.
+inline void ref_saxpy_shift(const float* a, const float* b, float* out, float s,
+                            int n) {
+  for (int i = 0; i < n; i++)
+    out[i] = (float)((double)s * (double)a[i + 1] + (double)b[i]);
+}
+
 // Histogram of values drawn from [-1, 1) into nbins equal-width bins. The bin
 // expression is character-identical to the kernel's so both round the same
 // way; the clamp keeps a value on or past the top edge inside the array.
