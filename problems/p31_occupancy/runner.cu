@@ -54,60 +54,73 @@ extern __global__ void SmemHog(const float* a, float* out, int n);
 // once in 69 runs, including under a load that dropped the SM clock to 904 MHz.
 constexpr float MARGIN = 1.05f;
 
-// The gate MARGIN sits behind, and the honest answer to a problem no estimator
-// can solve.
+// The throughput floor MARGIN sits behind: half of this runner's
+// measurement-validity check, the other half being the competing-process
+// detector in common/puzzle_utils.cuh (see QuietCheck there for the design and
+// for the three outcomes a timing section has).
 //
-// This is a shared-memory SoC: one LPDDR5X behind both the GPU and the CPUs.
-// When something else on the box takes a large share of it, PolyOne and
-// PolyFour stop being limited by their own exposed load latency and start
-// being limited by the contention -- and the ratio between them collapses
-// toward 1.0. That is physics, not noise. Under an external bottleneck the
-// per-thread amortisation genuinely stops paying, because the thing it
-// amortises is no longer the constraint. No estimator recovers an effect that
-// is not present, and a margin low enough to survive the contended floor would
-// not be a claim worth making.
+// Why a validity check at all. This is a shared-memory SoC: one LPDDR5X behind
+// both the GPU and the CPUs. When something else on the box takes a large share
+// of it, PolyOne and PolyFour stop being limited by their own exposed load
+// latency and start being limited by the contention -- and the ratio between
+// them collapses toward 1.0. That is physics, not noise. Under an external
+// bottleneck the per-thread amortisation genuinely stops paying, because the
+// thing it amortises is no longer the constraint. No estimator recovers an
+// effect that is not present, and a margin low enough to survive the contended
+// floor would not be a claim worth making.
 //
-// So the runner checks whether it got a measurement before it asserts anything
-// about one. PolyFour is the reference because it is the kernel with the least
-// slack of its own: on a quiet box it evaluates the polynomial at 139.5 billion
-// elements per second, reproducible to 0.1 % run after run.
+// So the runner establishes that it got a measurement before it asserts
+// anything about one, and a run that did not get one FAILs as
+// measurement_invalid rather than passing quietly. It never skips: a busy box is
+// not a wrong kernel, but it is not a green suite either.
 //
-// Where to put the gate is a measurement, not a rule of thumb. Across the 69
-// runs, sorted by PolyFour's quiet-window throughput:
+// Now the part that is specific to this puzzle, and that was re-measured for
+// these semantics because a floor that fires now costs a red suite rather than
+// a skipped line.
 //
-//   gate  admitted  skipped  ratio floor over admitted runs
-//     90     56/69      19%  1.0473   <- admits runs that would FAIL
-//     95     52/69      25%  1.0473   <- same
-//    100     46/69      33%  1.1066
-//    110     36/69      48%  1.1249
-//    120     28/69      59%  1.1249
+// PolyFour reaches 138.5-139.6 Gelem/s on a SETTLED idle box -- 30 consecutive
+// runs, a 0.8 % spread -- and 100 Gelem/s is 72 % of that. What the floor is
+// really demanding is that settled state, and the honest description of the
+// floor is that it is a settledness check, not a contention check. The
+// difference matters, and it is measurable:
 //
-// 100 Gelem/s is the lowest threshold at which no admitted run falls under
-// MARGIN, and every step above it buys almost no floor for a lot of SKIPs. It
-// is 72 % of the 139.5 Gelem/s this kernel reaches on a settled box.
+//   this box has an idle-but-unsettled state, and it is not rare. With the GPU
+//   verifiably free (the detector below reports zero competing processes), the
+//   CPUs at a load average of 0.15-0.65, the GPU at 38-40 C drawing a flat
+//   30-31 W, the SM clock flat at 2539-2561 MHz and cudaMalloc returning
+//   byte-identical addresses every run, fourteen consecutive runs measured
+//   88.2-139.0 Gelem/s. The rate is constant within any one process -- every one
+//   of the 201 reps of a slow run is slow -- and varies 1.6x between processes.
+//   It is not thermal, not DVFS, not which CPU the host thread lands on, and not
+//   another process. It takes minutes to clear after a heavy memory load.
 //
-// The gate earns its keep, and the numbers say how much: over 25 consecutive
-// runs in this box's ordinary working state -- no synthetic load, just the
-// other agents that live here -- 11 fell below the gate, and SIX of those 11
-// had ratios under MARGIN. Without the gate those six are FAILs on a machine
-// where nothing is wrong with the kernels. With it they are SKIPs.
+//   under load the rates OVERLAP that range completely. A sweep from 2 to 40 CPU
+//   memory streamer threads produced 28.8 to 137.6 Gelem/s. So the two
+//   populations do not separate on this axis and no threshold on it is a
+//   contention detector. That job belongs to the competing-process detector,
+//   which is causal and has none of this problem.
 //
-// What an unmeasurable run looks like is worth knowing, because it is not
-// subtle: PolyFour at 89.2 Gelem/s, the asserted ratio down to 1.1654, and the
-// smem_hog/poly_one ratio -- an effect with nothing to do with this assert --
-// flattened from its usual 1.19-1.22 to 1.0118. Every effect in the file
-// disappears at once. That is why the gate reads a throughput rather than
-// trying to sanity-check the ratio it is guarding.
+//   the floor is not redundant even so, because it is the only thing that sees
+//   CPU-side load at all: a process on the other side of this SoC's LPDDR5X
+//   holds no CUDA context and appears in no GPU-side accounting. Where it earns
+//   its keep is the deep end. Sub-MARGIN ratios were measured at 28.8-56.5
+//   Gelem/s, as low as 0.83, and 100 refuses all of them.
 //
-// One thing the gate is NOT is a DVFS check. The SM clock, measured by the
-// device itself below, is a flat 2530-2560 MHz on runs that come out anywhere
-// from 63 to 139 Gelem/s. What varies is how much of the LPDDR5X this process
-// can get, and nothing on the GPU side reports that.
-//
-// Below the gate the runner prints SKIP with the numbers and does not assert.
-// It does not FAIL, because a busy box is not a wrong kernel and a FAIL has to
-// mean the puzzle's claim is false. It does not pass quietly either.
+// It is left at 100 rather than lowered to fit the unsettled state, and the
+// reason is which mistake each setting makes. At 100, an unsettled run FAILs as
+// measurement_invalid: loud, non-zero, and explicitly not a claim about the
+// kernels. Lowered to clear the unsettled runs it would admit them, and one
+// contended run measured 110.3 Gelem/s with a ratio of 1.0440 -- under MARGIN --
+// so what a lower floor buys is FAILs that blame PolyFour for the machine. Of
+// the two, the first is the one this file is willing to print. It does mean a
+// red suite on a box that has not settled; the answer to that is to let it
+// settle, which is what the diagnosis says.
 constexpr double QUIET_GELEM = 100.0;
+
+// What PolyFour reaches on a settled idle box, quoted in the measurement_invalid
+// diagnosis so a reader can see how far off an invalid run was. Measured, not
+// asserted: the low end of the 30-run settled mode described above.
+constexpr double IDLE_GELEM = 138.5;
 
 struct Occ {
   int regs;
@@ -430,6 +443,13 @@ int main() {
   } else {
     long long* d_cycles;
     CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(long long)));
+    // Sampled here rather than immediately before bench_all: NVML resolves on
+    // the first watch() and that costs ~14 ms one-off, which must not land
+    // between the clock ramp below and the timed section. Subsequent samples
+    // cost ~25 us. watch() unions, so the window simply widens to cover the
+    // ramp as well.
+    QuietCheck qc{"PolyFour", "Gelem/s", QUIET_GELEM, IDLE_GELEM};
+    qc.watch();
     const float mhz_before = measure_sm_mhz(d_cycles);
 
     // Order matters by one place: PolyOne and PolyFour are adjacent, so the
@@ -442,6 +462,7 @@ int main() {
     void* args[] = {(void*)&d_a, (void*)&d_out, (void*)&n};
     std::vector<float> samples[3];
     bench_all(jobs, 3, TPB, args, WARMUP, ITERS, REPS, samples);
+    qc.watch();
     const float mhz_after = measure_sm_mhz(d_cycles);
     CHECK_CUDA(cudaFree(d_cycles));
 
@@ -473,49 +494,45 @@ int main() {
            " only: what the lost third of the occupancy actually costs\n",
            r_hog, hlo, hhi);
 
-    // How fast the quiet window actually ran, and the gate on whether anything
-    // above is a measurement of this GPU rather than of the rest of the box.
-    // See QUIET_GELEM.
+    // How fast the quiet window actually ran, and half of the answer to whether
+    // anything above is a measurement of this GPU rather than of the rest of
+    // the box. See QUIET_GELEM, and QuietCheck in common/puzzle_utils.cuh.
     const float quiet_ms = median_over(samples[1], quiet);
     const double quiet_gelem = n / (quiet_ms * 1e6);
-    printf("# quiet-window PolyFour: %.5f ms = %.1f Gelem/s (gate: >= %.0f"
-           " Gelem/s)\n",
+    printf("# quiet-window PolyFour: %.5f ms = %.1f Gelem/s (validity floor:"
+           " >= %.0f Gelem/s)\n",
            quiet_ms, quiet_gelem, QUIET_GELEM);
+    qc.report();
 
-    const bool measurable = quiet_gelem >= QUIET_GELEM;
-
-    if (!measurable) {
-      printf("SKIP occupancy_not_predictive: this run never got a quiet"
-             " window. The quietest %d of %d reps still ran PolyFour at %.1f"
-             " Gelem/s, under the %.0f Gelem/s gate and well under the 139.5"
-             " Gelem/s it reaches on a quiet box, so something else had the"
-             " memory system for the whole measurement.\n",
-             KEEP, REPS, quiet_gelem, QUIET_GELEM);
-      printf("SKIP   the ratios above are printed anyway and are real"
-             " measurements -- of a saturated machine. Under external load"
-             " both kernels become bound by the contention rather than by"
-             " their own exposed load latency, and the ratio collapses toward"
-             " 1.0; that is physics, not an estimator problem, and no amount"
-             " of rep selection recovers it. Correctness and"
-             " smem_limits_occupancy above are unaffected and were fully"
-             " checked. Re-run on an idle box.\n");
+    if (!qc.valid(quiet_gelem)) {
+      qc.fail("occupancy_not_predictive");
+      printf("FAIL   the ratios above are printed anyway and are real"
+             " measurements -- of a saturated machine. Under external load both"
+             " kernels become bound by the contention rather than by their own"
+             " exposed load latency, and the ratio collapses toward 1.0; that"
+             " is physics, not an estimator problem, and no amount of rep"
+             " selection recovers it. The quietest %d of %d reps were already"
+             " the best this run had.\n",
+             KEEP, REPS);
+      ok = false;
     } else if (ratio >= MARGIN) {
       printf("PASS occupancy_not_predictive (poly_one / poly_four = %.4fx >="
              " %.2fx, at %.1f%% vs %.1f%% occupancy)\n",
              ratio, MARGIN, 100.0 * one.frac, 100.0 * four.frac);
     } else {
-      printf("FAIL occupancy_not_predictive: poly_one / poly_four = %.4fx,"
-             " expected >= %.2fx\n",
+      printf("FAIL occupancy_not_predictive: ratio %.4fx below margin %.2fx --"
+             " the puzzle's performance claim did not hold on a quiet"
+             " machine\n",
              ratio, MARGIN);
       printf("FAIL   PolyFour does the same total arithmetic in a quarter of"
              " the threads, %d elements per thread instead of one; it should be"
              " decisively faster per element, and it was not\n",
              ELEMS);
-      printf("FAIL   this is a gated-in run -- PolyFour cleared %.1f Gelem/s in"
-             " its quiet window, so external load is NOT the explanation and"
-             " this FAIL means the puzzle's claim did not hold. Check that"
-             " PolyFour really covers %d elements per thread strided by"
-             " gridDim.x * blockDim.x, and that the runner launched it on"
+      printf("FAIL   this run passed the validity check -- no other process had"
+             " a CUDA context on this GPU, and PolyFour cleared %.1f Gelem/s in"
+             " its quiet window -- so external load is NOT the explanation."
+             " Check that PolyFour really covers %d elements per thread strided"
+             " by gridDim.x * blockDim.x, and that the runner launched it on"
              " cdiv(n, %d) threads rather than n.\n",
              quiet_gelem, ELEMS, ELEMS);
       printf("FAIL   (running under compute-sanitizer or ncu? set"

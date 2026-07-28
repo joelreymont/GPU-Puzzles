@@ -468,24 +468,64 @@ each other, as three implementations of the same arithmetic should be.
    once in 69 runs**, including under a load that dragged the SM clock from
    2535 MHz to 904 MHz — where the old estimator produced 0.899×.
 
-   **The gate.** Under enough external load the effect genuinely disappears, so
-   the runner checks whether it got a measurement before asserting anything
-   about one. It gates on `PolyFour`'s quiet-window throughput; below the
-   threshold it prints `SKIP` and exits 0, because a busy box is not a wrong
-   kernel and a `FAIL` has to mean the puzzle's claim is false. Where to put the
-   threshold is itself a measurement:
+   **The measurement-validity check.** Under enough external load the effect
+   genuinely disappears, so the runner establishes that it got a measurement
+   before asserting anything about one. Two checks, deliberately different in
+   kind, and a run that fails either one prints `FAIL measurement_invalid`,
+   names the evidence, and exits **non-zero** without evaluating the assert.
+   It does not `SKIP` and it does not exit 0: a busy box is not a wrong kernel,
+   but a run that proves nothing is not a run that passed either, and a green
+   suite has to mean the asserts were checked.
 
-   | gate | admitted | skipped | ratio floor over admitted runs |
-   |---|---|---|---|
-   | 90 Gelem/s | 56/69 | 19 % | 1.0473 — admits runs that would FAIL |
-   | 95 | 52/69 | 25 % | 1.0473 — same |
-   | **100** | **46/69** | **33 %** | **1.1066** |
-   | 110 | 36/69 | 48 % | 1.1249 |
-   | 120 | 28/69 | 59 % | 1.1249 |
+   *Causal — who else was on the GPU.* NVML's own compute-process accounting,
+   sampled before and after the timed section and unioned, reported through a
+   runtime `dlopen` of `libnvidia-ml.so.1` so no puzzle needs an extra link
+   flag. Verified here against a scratch bandwidth hog: it comes back by pid,
+   by name and by device memory, and it reports the runner's own process too,
+   which is why `getpid()` is excluded. The desktop's `Xorg` and `gnome-shell`
+   are *graphics* processes and come back from a different query, so they do
+   not void every run. Scanning `/proc/<pid>/fd` for `/dev/nvidia*` links was
+   measured as an alternative and found the same hog, but 386 of ~390
+   `/proc/<pid>/fd` directories are unreadable to an ordinary user, so it only
+   ever sees the caller's own processes; NVML crosses user boundaries.
 
-   **100 Gelem/s** — 72 % of the 139.5 Gelem/s roof — is the lowest threshold at
-   which no admitted run falls under `MARGIN`, and every step above it buys
-   almost no floor for a lot of `SKIP`s.
+   *Symptomatic — a throughput floor of 100 Gelem/s on `PolyFour`'s quiet
+   window.* This is the only check that sees a CPU process on the other side of
+   this SoC's LPDDR5X, which holds no CUDA context and appears in no GPU-side
+   accounting. What it is really demanding is the **settled** state — the
+   138.5–139.6 Gelem/s mode — and the honest description of it is a settledness
+   check rather than a contention check, because on this box those are not the
+   same thing:
+
+   | population | `PolyFour` Gelem/s | ratio |
+   |---|---|---|
+   | settled, idle (30 runs) | 138.5 – 139.6 | 1.281 – 1.289 |
+   | idle but unsettled (14 runs) | 88.2 – 139.0 | 1.070 – 1.440 |
+   | 2 – 40 CPU streamer threads | 28.8 – 137.6 | 0.827 – 1.349 |
+
+   The unsettled runs had the GPU verifiably free, the CPUs at a load average
+   of 0.15–0.65, the GPU at 38–40 °C drawing a flat 30–31 W, the SM clock flat
+   at 2539–2561 MHz and `cudaMalloc` returning byte-identical addresses. The
+   rate is constant *within* a process — every one of the 201 reps of a slow
+   run is slow — and varies 1.6× *between* processes. It is not thermal, not
+   DVFS, not which CPU the host thread lands on, and not another process; it
+   takes minutes to clear after a heavy memory load.
+
+   So the idle and contended rate distributions overlap almost completely, and
+   no threshold on this axis is a contention detector — that job belongs to the
+   causal check. What the floor is for is the deep end, where the ratio actually
+   inverts: sub-`MARGIN` ratios were measured at 28.8–56.5 Gelem/s, as low as
+   0.827, and 100 refuses all of them.
+
+   **100 Gelem/s is kept rather than lowered to fit the unsettled state**, and
+   the reason is which mistake each setting makes. At 100, an unsettled run
+   fails as `measurement_invalid`: loud, non-zero, and explicitly not a claim
+   about the kernels. Lowered to admit those runs it would also admit contended
+   ones — one measured **110.3 Gelem/s with a ratio of 1.0440**, over any such
+   floor and under `MARGIN` — so what a lower floor buys is `FAIL`s that blame
+   `PolyFour` for the machine. Of the two, the first is the one this runner is
+   willing to print. It does mean a red suite on a box that has not settled; the
+   answer is to let it settle, which is what the diagnosis says.
 
    **`MARGIN` is therefore 1.05**, 0.057 below the 1.1066 gated-in floor. 1.10
    was tried and is not defensible: it would clear that floor by 0.0066, one
@@ -496,15 +536,26 @@ each other, as three implementations of the same arithmetic should be.
    ratio is printed every run either way, so the size of the effect is always
    visible; the assert only has to be true.
 
-   **What the gate is worth, measured.** Over 25 consecutive runs in this box's
-   ordinary working state — no synthetic load, just the other agents that live
-   here — 11 fell below the gate and **6 of those 11 had ratios under `MARGIN`**.
-   Without the gate those six are `FAIL`s on a machine where nothing is wrong
-   with the kernels. Final verification with both constants in place: 20
-   consecutive runs, **15 PASS, 5 SKIP, 0 FAIL**, every exit code 0, lowest
-   gated-in ratio 1.1208.
+   **What the validity check is worth, measured.** Over 25 consecutive runs in
+   this box's ordinary working state — no synthetic load, just the other agents
+   that live here — 11 fell below the floor and **6 of those 11 had ratios under
+   `MARGIN`**. Without the check those six are `FAIL`s of the puzzle's claim on
+   a machine where nothing is wrong with the kernels.
 
-   **What an unmeasurable run looks like** is not subtle, which is why the gate
+   The causal half is worth more, and the clearest evidence is what the runner
+   did *before* it existed. With a scratch GPU bandwidth hog holding 2.2 GB of
+   this device and 20 CPU memory streamer threads running, six consecutive runs
+   of the previous runner produced four `SKIP`s and — worse — **two `PASS`es**,
+   at 101.3 and 101.4 Gelem/s, every one of them exit 0. The suite went green
+   on a machine with another process on the GPU. The same load against the
+   current runner produces `FAIL measurement_invalid` naming the hog's pid and
+   its 2218 MiB, exit 1, and `make test` exits non-zero.
+
+   Final verification with both constants in place: `make test` three times on a
+   settled idle box, **all seven timing asserts PASS**, exit 0, zero `SKIP`
+   lines anywhere in the suite.
+
+   **What an unmeasurable run looks like** is not subtle, which is why the floor
    reads a throughput rather than trying to sanity-check the ratio it guards:
    `PolyFour` at 89.2 Gelem/s, the asserted ratio down to 1.1654, and
    `smem_hog`/`poly_one` — an effect with nothing to do with that assert —

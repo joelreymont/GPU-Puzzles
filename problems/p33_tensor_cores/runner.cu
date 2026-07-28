@@ -72,6 +72,42 @@ constexpr float TOL_WMMA = 1e-4f;
 // and the tensor core wins by 4x anyway.
 constexpr float MARGIN = 3.0f;
 
+// The throughput floor the timing section sits behind, together with the
+// competing-process detector in common/puzzle_utils.cuh. QuietCheck there
+// documents the design and the three outcomes a timing section has; what belongs
+// here are this puzzle's numbers.
+//
+// GemmWmma is the reference kernel: it fills 0.14 of a wave of this machine, so
+// it has the least of its own latency to hide and its throughput moves first when
+// something else takes the LPDDR5X this SoC shares between the GPU and the CPUs.
+// It is also the denominator of the asserted ratio.
+//
+// Measured on this box. Fifteen consecutive runs on a settled idle box:
+// 5089.5-5161.7 GFLOP/s, a 1.4 % spread; the lowest figure seen on an idle GPU
+// across every session was 5005.3.
+//
+// This floor is a tripwire rather than a discriminator, and the numbers say why.
+// The problem is 320 x 256 x 192 and both kernels' working sets are small, so
+// external load barely reaches them: under 40 CPU memory streamer threads over
+// 40 GB, six runs measured 5079.0-5101.4 GFLOP/s with the ratio at 3.981-4.035.
+// Under two GPU bandwidth hogs plus 20 CPU streamers -- a load that halves this
+// box's L2-resident puzzles -- eight runs still measured 4542.7-4673.4 GFLOP/s
+// with the ratio at 3.777-3.907, which is 26 % clear of MARGIN. No load this box
+// could be made to produce brought this assert near its margin.
+//
+// So the floor is placed as a tripwire: 4000 GFLOP/s is 20 % below the lowest
+// idle observation and 12 % below the worst contended one, and it exists to
+// refuse a collapse deeper than anything above rather than to separate two
+// populations that do not in fact separate here. What it must not be is set so
+// high that it fires on a machine that was in fact quiet; the discrimination on
+// this puzzle is done by the competing-process detector.
+constexpr double QUIET_GFLOPS = 4000.0;
+
+// What GemmWmma reaches on a settled idle box, quoted in the measurement_invalid
+// diagnosis so a reader can see how far off an invalid run was. Measured, not
+// asserted: the low end of the idle spread above.
+constexpr double IDLE_GFLOPS = 5089.5;
+
 // The same quantity compare() thresholds -- |got - want| / max(|want|, 1) --
 // but reported rather than only asserted. The tolerances above were chosen
 // from these numbers, so the numbers belong in the output.
@@ -292,7 +328,10 @@ int main() {
           (void*)&K}},
     };
     float ms[2];
+    QuietCheck qc{"GemmWmma", "GFLOP/s", QUIET_GFLOPS, IDLE_GFLOPS};
+    qc.watch();
     bench_all(jobs, 2, WARMUP, ITERS, REPS, ms);
+    qc.watch();
 
     // Both kernels compute the same product, so the flop count is the same for
     // both and GFLOP/s is a fair second axis: 2 * M * N * K counts one multiply
@@ -308,14 +347,25 @@ int main() {
              flops / (ms[k] * 1e6));
     }
 
+    const double wmma_gflops = flops / (ms[1] * 1e6);
+    qc.report();
+
     const float ratio = ms[0] / ms[1];
-    if (ratio >= MARGIN) {
+    if (!qc.valid(wmma_gflops)) {
+      qc.fail("tensor_cores_beat_fp32");
+      printf("FAIL   the ratio above is printed anyway and is a real"
+             " measurement -- of a saturated machine. Under external load both"
+             " kernels inflate and the smaller one inflates proportionally"
+             " more, so the ratio understates the tensor pipe.\n");
+      ok = false;
+    } else if (ratio >= MARGIN) {
       printf("PASS tensor_cores_beat_fp32 (naive / wmma = %.3fx >= %.2fx, same"
              " values, same product, different pipe)\n",
              ratio, MARGIN);
     } else {
-      printf("FAIL tensor_cores_beat_fp32: naive / wmma = %.3fx, expected"
-             " >= %.2fx\n",
+      printf("FAIL tensor_cores_beat_fp32: ratio %.3fx below margin %.2fx --"
+             " the puzzle's performance claim did not hold on a quiet"
+             " machine\n",
              ratio, MARGIN);
       printf("FAIL   GemmNaiveFp32 issues %d FFMA per thread over %d threads;"
              " GemmWmma issues %d mma_sync per warp over %d warps, and each one"
@@ -323,11 +373,11 @@ int main() {
              " the wmma kernel really is looping over K and not computing one"
              " fragment, and that every warp got a distinct tile.\n",
              K, M * N, K / MMA, tiles_m * tiles_n);
-      printf("FAIL   a ratio below the margin can also mean another process is"
-             " loading this shared-memory SoC -- the GPU and the CPUs share one"
-             " LPDDR5X, and under contention both kernels inflate and the"
-             " smaller one inflates proportionally more. Re-run on an idle"
-             " box.\n");
+      printf("FAIL   this run passed the validity check -- no other process had"
+             " a CUDA context on this GPU, and GemmWmma cleared %.1f GFLOP/s --"
+             " so another process loading this shared-memory SoC is NOT the"
+             " explanation, and it is not what this FAIL is claiming.\n",
+             wmma_gflops);
       printf("FAIL   (running under compute-sanitizer or ncu? set"
              " P33_SKIP_TIMING=1 -- instrumented wall-clock time is not a"
              " measurement of this machine)\n");

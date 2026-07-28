@@ -380,22 +380,46 @@ shared-memory SoC: one LPDDR5X behind the GPU and the CPUs both. When something
 else takes a large share of it, all three kernels stop being limited by their own
 sector traffic and the ratios collapse toward 1.0 — which is *true*, not noisy:
 under an external bottleneck the extra sector genuinely costs nothing. No
-estimator recovers an effect that is not present. So the runner gates both
-asserts on `SaxpyVec4` reaching **1600 GB/s** in its quiet window, 91 % of the
-~1755 GB/s it hits idle. Over a 105-run campaign on a box with other work on it,
-70 runs cleared the gate — landing at 1613–1759 GB/s, every one of them passing
-both asserts, `misaligned / vec4` never below 1.102 — and the 35 that did not
-landed at 731–1598 GB/s with `misaligned / vec4` as low as **0.958**. Several of
-those would have failed the assert, one of them by being outright inverted.
-Below the gate the runner prints `SKIP` with the numbers and does not assert; it
-does not fail, because a busy box is not a wrong kernel, and it does not pass
-quietly either.
+estimator recovers an effect that is not present. So before it asserts anything
+the runner establishes that it **got a measurement**, with two checks that are
+deliberately different in kind:
 
-The gate is deliberately on the conservative side of that band: under the
-synthetic load above, eighteen further runs all landed at 1252–1374 GB/s and
-were declined even though their ratios (1.140–1.164) were still perfectly good.
-Declining a measurable run costs a `SKIP` line; accepting an unmeasurable one
-costs the truth.
+- It asks the driver, through NVML, which other processes held a CUDA context on
+  this GPU while the section was being timed — sampled before and after, and
+  unioned. This is causal: it names the competing PIDs and their device memory,
+  and it fires whether or not the contention happened to show up in the timings.
+- It holds `SaxpyVec4`'s quiet window to **1600 GB/s**, 91 % of the 1748–1759
+  GB/s it reaches on a settled idle box. This is the only check that sees a CPU
+  process on the other side of this SoC's LPDDR5X: such a process holds no CUDA
+  context and appears in no GPU-side accounting, but it is what actually
+  flattens these ratios.
+
+That gives the timing section three outcomes and no silent one. A valid run
+whose ratios clear their margins prints `PASS`. A valid run whose ratios do not
+prints `FAIL misalignment_costs_sectors` or `FAIL vec4_never_slower` — the claim
+did not hold on a quiet machine. A run that was **not a measurement** prints
+`FAIL measurement_invalid` with the evidence, and exits non-zero without
+evaluating either assert. It never says your kernel is wrong, and it never exits
+0 either: a run that proves nothing is not a run that passed.
+
+The floor is on the conservative side, and that is a deliberate choice about
+which mistake to make. `MARGIN_SPAN` is 1.05 and it has very little headroom in
+its low tail — over 25 runs on an idle box `misaligned / vec4` measured
+1.086–1.283, but a run at 914 GB/s came in at 1.0495 and one under 40 CPU memory
+streamer threads at 547 GB/s came in at 1.0257, with `scalar / vec4` at 1.0020
+against a margin of 1.00. The margin only reliably holds in the settled mode, so
+the floor demands the settled mode. Runs that are merely *unsettled* — this box
+takes minutes to recover from a heavy memory load, and measured 1065–1505 GB/s
+throughout one such window with nothing else on the GPU — are refused too, even
+though their ratios were fine. Refusing a measurable run costs a re-run;
+admitting an unmeasurable one costs a `FAIL` that blames `SaxpyMisaligned` for
+the machine.
+
+What the floor cannot do is stand in for asking the driver, and the numbers say
+why: under twenty CPU streamer threads ten runs measured 1602–1736 GB/s and
+cleared the floor while the machine was under heavy memory load. An absolute
+rate is a weak proxy for who else is on the machine. Asking the driver is not a
+proxy at all.
 
 ## Undefined behaviour, and what it does here
 

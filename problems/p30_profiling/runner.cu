@@ -11,6 +11,45 @@ extern __global__ void GroupSumStream(const float* a, float* out, int n);
 // is in solutions/p30_profiling/SOLUTION.md, measured.
 constexpr float MARGIN = 1.25f;
 
+// The throughput floor this runner's timing section sits behind, together with
+// the competing-process detector in common/puzzle_utils.cuh. QuietCheck there
+// documents the design and the three outcomes a timing section has; what belongs
+// here are this puzzle's numbers.
+//
+// GroupSumStream is the reference kernel: it is the one of the two closer to a
+// bandwidth limit, so it is the one whose throughput moves first when something
+// else takes the LPDDR5X this SoC shares between the GPU and the CPUs.
+//
+// Measured on this box. Fifteen consecutive runs on a settled idle box: 966.7 to
+// 973.3 GB/s, a 0.7 % spread. The lowest figure ever seen on an idle GPU here is
+// 697.8 GB/s, during the several minutes it takes the box to settle after a
+// heavy memory load.
+//
+// What this floor is NOT is the thing that decides whether the run was quiet:
+// that is the competing-process detector, and on this puzzle it is doing
+// essentially all of the work. cache_hit_paradox turns out to be remarkably
+// robust to contention, and the numbers are worth recording because they say how
+// much this floor can be asked for. Under 40 CPU memory streamer threads over
+// 40 GB, six runs measured 646.5-920.1 GB/s and the ratio never fell below
+// 1.872 -- 50 % clear of MARGIN. Under two GPU bandwidth hogs plus 20 CPU
+// streamers, eight runs measured 619.0-672.6 GB/s and the ratio never fell below
+// 1.805. Every load this box could be made to produce left this assert with
+// more than 40 % headroom.
+//
+// So the floor is a tripwire rather than a discriminator, and it is placed as
+// one: 600 GB/s is below every rate ever measured here, idle or contended, and
+// it exists to refuse a collapse deeper than anything above -- the regime in
+// which a 1.25x claim could plausibly stop holding for reasons that have nothing
+// to do with the two load paths. A tripwire that has never fired is still worth
+// having when the alternative is a FAIL that blames the kernels; what it must
+// not be is set so high that it fires on a machine that was in fact quiet.
+constexpr double QUIET_GBPS = 600.0;
+
+// What GroupSumStream reaches on a settled idle box, quoted in the
+// measurement_invalid diagnosis so a reader can see how far off an invalid run
+// was. Measured, not asserted.
+constexpr double IDLE_GBPS = 966.7;
+
 // The kernels are launched through cudaLaunchKernel rather than <<<>>> so the
 // timing loop is written once: CUDA does not allow <<<>>> through a function
 // pointer, but the host-side stub address is a perfectly good kernel handle.
@@ -111,11 +150,14 @@ int main() {
     // What each kernel actually moves through L1 to achieve that is the
     // subject of `make prof P=30`, and it is not this number.
     const double bytes = 2.0 * n * sizeof(float);
+    QuietCheck qc{"GroupSumStream", "GB/s", QUIET_GBPS, IDLE_GBPS};
+    qc.watch();
     const float ms_red =
         bench((const void*)GroupSumRedundant, BLOCKS, TPB, d_a, d_out, n,
               WARMUP, ITERS);
     const float ms_str = bench((const void*)GroupSumStream, BLOCKS, TPB, d_a,
                                d_out, n, WARMUP, ITERS);
+    qc.watch();
     printf("# timing: %d warmup + %d timed iterations, %.2f MB of useful"
            " traffic per iteration\n",
            WARMUP, ITERS, bytes / 1e6);
@@ -125,17 +167,32 @@ int main() {
     printf("  %-20s %9.4f %10.1f\n", "group_sum_stream", ms_str,
            bytes / (ms_str * 1e6));
 
+    const double stream_gbps = bytes / (ms_str * 1e6);
+    qc.report();
+
     const float ratio = ms_red / ms_str;
-    if (ratio >= MARGIN) {
+    if (!qc.valid(stream_gbps)) {
+      qc.fail("cache_hit_paradox");
+      printf("FAIL   the ratio above is printed anyway and is a real"
+             " measurement -- of a saturated machine. Both kernels become bound"
+             " by the contention rather than by their own load paths, and the"
+             " ratio collapses toward 1.0.\n");
+      ok = false;
+    } else if (ratio >= MARGIN) {
       printf("PASS cache_hit_paradox (ratio %.3fx >= %.2fx)\n", ratio, MARGIN);
     } else {
-      printf("FAIL cache_hit_paradox: group_sum_redundant / group_sum_stream ="
-             " %.3fx, expected >= %.2fx\n",
+      printf("FAIL cache_hit_paradox: ratio %.3fx below margin %.2fx -- the"
+             " puzzle's performance claim did not hold on a quiet machine\n",
              ratio, MARGIN);
       printf("FAIL   the kernel that re-reads its group %d times over should be"
              " decisively slower than the one that reads each element once;"
              " it was not\n",
              GROUP);
+      printf("FAIL   this run passed the validity check -- no other process had"
+             " a CUDA context on this GPU, and group_sum_stream cleared %.1f"
+             " GB/s -- so external load is NOT the explanation, and it is not"
+             " what this FAIL is claiming.\n",
+             stream_gbps);
       printf("FAIL   (running under compute-sanitizer or ncu? set"
              " P30_SKIP_TIMING=1 -- instrumented wall-clock time is not a"
              " measurement of this machine)\n");

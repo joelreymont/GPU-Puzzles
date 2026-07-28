@@ -97,42 +97,67 @@ constexpr float TOL = 1e-6f;
 constexpr float MARGIN_VEC4 = 1.00f;
 constexpr float MARGIN_SPAN = 1.05f;
 
-// The gate both asserts sit behind, and the honest answer to a problem the two
-// margins above cannot solve on their own.
+// The throughput floor both asserts sit behind: half of this runner's
+// measurement-validity check, the other half being the competing-process
+// detector in common/puzzle_utils.cuh (see QuietCheck there for the design and
+// for the three outcomes a timing section has).
 //
-// This is a shared-memory SoC: one LPDDR5X behind both the GPU and the CPUs.
-// When something else on the box takes a large share of it, all three kernels
-// here stop being limited by their own sector traffic and start being limited
-// by the contention -- and the ratios between them collapse toward 1.0. That is
-// physics, not noise: under an external bottleneck the extra sector genuinely
-// costs nothing, because the sector path is no longer the constraint. No
-// estimator recovers an effect that is not present, and no margin below the
-// contended floor would be a claim worth making (the floor is 1.00).
+// Why a validity check at all. This is a shared-memory SoC: one LPDDR5X behind
+// both the GPU and the CPUs. When something else on the box takes a large share
+// of it, all three kernels here stop being limited by their own sector traffic
+// and start being limited by the contention -- and the ratios between them
+// collapse toward 1.0. That is physics, not noise: under an external bottleneck
+// the extra sector genuinely costs nothing, because the sector path is no longer
+// the constraint. No estimator recovers an effect that is not present, and no
+// margin below the contended floor would be a claim worth making (the floor is
+// 1.00).
 //
-// So the runner checks whether it got a measurement before it asserts anything
-// about one. SaxpyVec4 is the reference because it is the kernel with the least
-// of its own slack: on an idle box it moves the 18 MB at ~1755 GB/s, run after
-// run, with a quiet-window spread under 2 % inside any one run.
+// So the runner establishes that it got a measurement before it asserts anything
+// about one, and a run that did not get one FAILs as measurement_invalid rather
+// than passing quietly. It never skips: a busy box is not a wrong kernel, but it
+// is not a green suite either.
 //
-// The gate earns its keep. Over a 105-run campaign on a box with other work on
-// it, 70 runs cleared 1600 GB/s, landing at 1613-1759, and every one of them
-// passed both asserts with misaligned/vec4 never below 1.102. The 35 that did
-// not clear it landed at 731-1598 GB/s and their misaligned/vec4 ran as low as
-// 0.958 -- several would have failed MARGIN_SPAN, one of them by being outright
-// inverted. 1600 GB/s is 91 % of the idle roof and lands between the two
-// populations.
+// SaxpyVec4 is the reference kernel because it has the least slack of its own:
+// on a settled idle box it moves the 18 MB at 1748-1759 GB/s, run after run,
+// with a quiet-window spread under 2 % inside any one run and under 1 % across
+// runs. That tightness is what makes a floor possible at all.
 //
-// The gate is deliberately on the conservative side. Under a synthetic load --
-// a GPU bandwidth hog, eight CPU memory streamers and three concurrent copies
-// of this binary -- eighteen further runs all landed at 1252-1374 GB/s and were
-// declined, even though their ratios (1.140-1.164) were still perfectly good.
-// Declining a measurable run costs a SKIP line; accepting an unmeasurable one
-// costs the truth.
+// Where the floor goes was re-measured on this box for these semantics, because
+// a floor that fires now costs a red suite rather than a skipped line. What it
+// is really demanding is the settled state above, and the honest description of
+// it is a settledness check rather than a contention check:
 //
-// Below the gate the runner prints SKIP with the numbers and does not assert.
-// It does not fail, because a busy box is not a wrong kernel, and it does not
-// pass quietly either.
+//   this box has an idle-but-unsettled state, and it takes minutes to clear
+//   after a heavy memory load. During it, with the GPU verifiably free (the
+//   detector below reports zero competing processes) and the CPUs at a load
+//   average under 1, fifteen consecutive runs measured 1064.8-1505.0 GB/s.
+//
+//   under load the rates overlap that: twenty CPU streamer threads left ten runs
+//   at 1602-1736 GB/s, over this floor, on a machine under heavy memory load. An
+//   absolute rate is a weak proxy for who else is on the machine. Asking the
+//   driver, which is what the other detector does, is not a proxy at all.
+//
+// The floor stays at 1600 anyway, and the reason is MARGIN_SPAN rather than the
+// rate. That margin is 1.05 and it has almost no headroom in its low tail: over
+// 25 runs on an idle box misaligned/vec4 measured 1.0864-1.2830, but a run at
+// 914.1 GB/s came in at 1.0495 and one under 40 CPU streamer threads at 546.9
+// GB/s came in at 1.0257, with scalar/vec4 at 1.0020 against MARGIN_VEC4's 1.00
+// -- four thousandths from inverting. The margin only reliably holds in the
+// settled mode, so the floor demands the settled mode.
+//
+// That is a deliberate choice about which mistake to make. At 1600 an unsettled
+// run FAILs as measurement_invalid: loud, non-zero, and explicitly not a claim
+// about the kernels. Lowered to admit the unsettled runs it would turn those
+// same runs into FAILs of misalignment_costs_sectors -- blaming SaxpyMisaligned
+// for a machine that had not settled. Of the two, the first is the one this file
+// is willing to print. It does mean a red suite on a box that has not settled;
+// the answer to that is to let it settle, which is what the diagnosis says.
 constexpr double QUIET_GBPS = 1600.0;
+
+// What SaxpyVec4 reaches on a settled idle box, quoted in the
+// measurement_invalid diagnosis so a reader can see how far off an invalid run
+// was. Measured, not asserted: the low end of the settled idle mode above.
+constexpr double IDLE_GBPS = 1748.5;
 
 // The same quantity compare() thresholds -- |got - want| / max(|want|, 1) --
 // but reported rather than only asserted. The tolerance above was chosen from
@@ -463,6 +488,13 @@ int main() {
   } else {
     long long* d_cycles;
     CHECK_CUDA(cudaMalloc(&d_cycles, sizeof(long long)));
+    // Sampled here rather than immediately before bench_all: NVML resolves on
+    // the first watch() and that costs ~14 ms one-off, which must not land
+    // between the clock ramp below and the timed section. Subsequent samples
+    // cost ~25 us. watch() unions, so the window simply widens to cover the
+    // ramp as well.
+    QuietCheck qc{"SaxpyVec4", "GB/s", QUIET_GBPS, IDLE_GBPS};
+    qc.watch();
     const float mhz_before = measure_sm_mhz(d_cycles);
 
     // Order matters by one place: SaxpyScalar sits between the other two, so
@@ -476,6 +508,7 @@ int main() {
                     (void*)&n};
     std::vector<float> samples[3];
     bench_all(jobs, 3, TPB, args, WARMUP, ITERS, REPS, samples);
+    qc.watch();
     const float mhz_after = measure_sm_mhz(d_cycles);
     CHECK_CUDA(cudaFree(d_cycles));
 
@@ -523,31 +556,29 @@ int main() {
            " README.\n",
            r_misaligned, mlo, mhi);
 
-    // How fast the quiet window actually ran, and the gate on whether anything
-    // above is a measurement of this GPU rather than of the rest of the box.
-    // See QUIET_GBPS.
+    // How fast the quiet window actually ran, and half of the answer to whether
+    // anything above is a measurement of this GPU rather than of the rest of the
+    // box. See QUIET_GBPS, and QuietCheck in common/puzzle_utils.cuh.
     const float quiet_ms = median_over(samples[0], quiet);
     const double quiet_gbps = bytes / (quiet_ms * 1e6);
-    printf("# quiet-window SaxpyVec4: %.5f ms = %.1f GB/s (gate: >= %.0f"
-           " GB/s)\n",
+    printf("# quiet-window SaxpyVec4: %.5f ms = %.1f GB/s (validity floor:"
+           " >= %.0f GB/s)\n",
            quiet_ms, quiet_gbps, QUIET_GBPS);
+    qc.report();
 
-    const bool measurable = quiet_gbps >= QUIET_GBPS;
+    const bool measurable = qc.valid(quiet_gbps);
 
     if (!measurable) {
-      printf("SKIP misalignment_costs_sectors, vec4_never_slower: this run"
-             " never got a quiet window. The quietest %d of %d reps still ran"
-             " SaxpyVec4 at %.1f GB/s against the %.0f GB/s this kernel reaches"
-             " when the machine is idle, so something else had the memory"
-             " system for the whole measurement.\n",
-             KEEP, REPS, quiet_gbps, QUIET_GBPS);
-      printf("SKIP   the three ratios above are printed anyway and are real"
+      qc.fail("misalignment_costs_sectors and vec4_never_slower");
+      printf("FAIL   the three ratios above are printed anyway and are real"
              " measurements -- of a saturated machine. Under external load all"
              " three kernels become bound by the contention rather than by"
              " their own sector traffic and the ratios collapse toward 1.0;"
              " that is physics, not an estimator problem, and no amount of"
-             " rep selection recovers the effect. Correctness above is"
-             " unaffected. Re-run on an idle box.\n");
+             " rep selection recovers the effect. The quietest %d of %d reps"
+             " were already the best this run had.\n",
+             KEEP, REPS);
+      ok = false;
     }
 
     if (measurable && r_span >= MARGIN_SPAN) {
@@ -555,8 +586,9 @@ int main() {
              " %.2fx, from one extra sector per %d-lane load request)\n",
              r_span, MARGIN_SPAN, WARP);
     } else if (measurable) {
-      printf("FAIL misalignment_costs_sectors: misaligned / vec4 = %.4fx,"
-             " expected >= %.2fx\n",
+      printf("FAIL misalignment_costs_sectors: ratio %.4fx below margin %.2fx"
+             " -- the puzzle's performance claim did not hold on a quiet"
+             " machine\n",
              r_span, MARGIN_SPAN);
       printf("FAIL   SaxpyMisaligned reads a[i + 1] where the other two read"
              " a[i]. Same arithmetic, same bytes, same coalescing -- the only"
@@ -570,10 +602,11 @@ int main() {
              WARP * (int)sizeof(float) / SECTOR);
       printf("FAIL   this is the most contention-resistant of the three ratios"
              " -- SaxpyVec4 is pinned to the sector path in both of"
-             " SaxpyScalar's modes -- and it cleared this margin on all 70"
-             " gated-in runs of a 105-run campaign, with a floor of 1.102x. A"
-             " busy machine is not the likely explanation; the gate above"
-             " exists to rule it out.\n");
+             " SaxpyScalar's modes -- and this run passed the validity check"
+             " above: no other process had a CUDA context on this GPU, and"
+             " SaxpyVec4 cleared %.1f GB/s. A busy machine is not the"
+             " explanation, and it is not what this FAIL is claiming.\n",
+             quiet_gbps);
       printf("FAIL   (running under compute-sanitizer or ncu? set"
              " P35_SKIP_TIMING=1 -- instrumented wall-clock time is not a"
              " measurement of this machine)\n");
@@ -587,8 +620,8 @@ int main() {
              " vectorisation)\n",
              r_vec4, MARGIN_VEC4);
     } else if (measurable) {
-      printf("FAIL vec4_never_slower: scalar / vec4 = %.4fx, expected"
-             " >= %.2fx\n",
+      printf("FAIL vec4_never_slower: ratio %.4fx below margin %.2fx -- the"
+             " puzzle's performance claim did not hold on a quiet machine\n",
              r_vec4, MARGIN_VEC4);
       printf("FAIL   SaxpyVec4 issues one 128-bit load per operand per thread"
              " where SaxpyScalar issues four 32-bit ones for the same four"
@@ -598,8 +631,9 @@ int main() {
              " element: four separate reads of a[4 * i + k] per thread is a"
              " stride-4 warp access and costs 16 sectors per request, not 4.\n");
       printf("FAIL   moderate contention pushes this ratio UP, not down, and"
-             " severe contention is what the gate above rules out, so a busy"
-             " machine does not explain a value below the margin here. What"
+             " severe contention is what the validity check above rules out, so"
+             " a busy machine does not explain a value below the margin here."
+             " What"
              " does is a launch geometry in which SaxpyScalar is not"
              " issue-limited at all: at 128 threads per block instead of %d the"
              " scalar kernel reaches the sector roof on its own and this ratio"

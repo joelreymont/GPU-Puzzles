@@ -47,11 +47,22 @@ Notes for this box (DGX Spark):
   the GPU (it gates puzzle 34 on measured cluster support).
 - `make prof` runs `sudo /usr/local/cuda/bin/ncu` (driver restricts profiling;
   a NOPASSWD sudoers rule for exactly that binary is expected).
-- Timing puzzles (30, 31, 35) assert measured performance relationships. Under
-  concurrent load on this shared-memory SoC they print `SKIP` with an
-  explanation instead of failing — correctness is always checked. Re-run idle
-  for the full result. Every performance number in the READMEs was measured
-  here; expect different numbers on other hardware.
+- Timing puzzles (30, 31, 32, 33, 35) assert measured performance
+  relationships, and they **fail loudly when this box is not idle** — they
+  never skip and never pass quietly. Each timing section first establishes that
+  it got a measurement, by asking the driver which other processes held a CUDA
+  context while it was timing and by holding its reference kernel to a
+  throughput floor. That gives three outcomes and no silent one:
+  `PASS <assert>` when the run is valid and the ratio clears its margin;
+  `FAIL <assert>` when the run is valid and the ratio does not — the puzzle's
+  claim did not hold on a quiet machine; and `FAIL measurement_invalid` when
+  the run was not a measurement at all, naming the competing PIDs or the
+  measured-versus-floor throughput. The third never claims the kernels are
+  wrong, and it still exits non-zero, because a green suite has to mean the
+  asserts were evaluated. Correctness checks and the deterministic asserts
+  (`smem_limits_occupancy`, `cluster_geometry`) always run and can always fail.
+  Re-run on an idle box after a `measurement_invalid`. Every performance number
+  in the READMEs was measured here; expect different numbers on other hardware.
 
 The original puzzles 1–14 live in `GPU_puzzlers_exec/` (edit `*_kernel.cu`,
 run `make test` in that directory). Everything below this line is the upstream

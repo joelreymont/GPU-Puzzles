@@ -204,11 +204,30 @@ estimator is doing real work:
   `clock64()`. `nvidia-smi` reports 208 MHz on this box while the device is
   actually at ~2540 MHz, so it is not usable as a check on whether your
   measurement was taken at a sane clock.
-- If the quiet window still fails an absolute throughput floor, the runner
-  prints **`SKIP`** and exits 0 rather than failing. Under enough external load
-  every effect in this puzzle genuinely disappears, and that is a fact about
-  your box, not about your kernel. A `FAIL` from this runner always means the
-  claim was false, never that the machine was busy.
+- Before it asserts anything, the runner establishes that it **got a
+  measurement**. Two checks, deliberately different in kind: it asks the driver
+  (through NVML) which other processes held a CUDA context on this GPU while the
+  section was being timed, and it holds `PolyFour`'s quiet window to an absolute
+  throughput floor. The first is causal and names the competing PIDs; the second
+  is the only one that sees a CPU process on the other side of this SoC's
+  LPDDR5X, which holds no CUDA context and appears in no GPU-side accounting.
+- That gives the timing section three outcomes and no silent one. A valid run
+  whose ratio clears `MARGIN` prints `PASS occupancy_not_predictive`. A valid
+  run whose ratio does not prints `FAIL occupancy_not_predictive` — the claim
+  did not hold on a quiet machine, and the message says which kernel to look
+  at. A run that was **not a measurement** prints `FAIL measurement_invalid`
+  with the evidence — the competing PIDs, or the throughput against the floor —
+  and exits non-zero without evaluating the assert at all.
+- The third outcome is a `FAIL` and not a `SKIP`, and that is the point. Under
+  enough external load every effect in this puzzle genuinely disappears, which
+  is a fact about your box and not about your kernel — but a run that proves
+  nothing is not a run that passed, and a green suite has to mean the asserts
+  were evaluated. So `measurement_invalid` never says your kernel is wrong, and
+  it never exits 0 either. Re-run on an idle box.
+- Correctness and `smem_limits_occupancy` sit outside all of this. They are not
+  wall-clock measurements — one is arithmetic on your outputs, the other is
+  arithmetic on your binary — so they run on every run, including instrumented
+  ones, and they can always fail.
 
 > `ncu` needs permission to read the GPU's performance counters, which on this
 > box is admin-only (`RmProfilingAdminOnly: 1`). If `make prof` reports

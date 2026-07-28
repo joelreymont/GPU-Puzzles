@@ -35,6 +35,42 @@ constexpr float MARGIN = 1.25f;
 constexpr float SWIZZLE_LO = 0.90f;
 constexpr float SWIZZLE_HI = 1.10f;
 
+// The throughput floor both asserts sit behind, together with the
+// competing-process detector in common/puzzle_utils.cuh. QuietCheck there
+// documents the design and the three outcomes a timing section has; what belongs
+// here are this puzzle's numbers.
+//
+// TransposePadded is the reference kernel: it is the conflict-free one, so it is
+// the one closest to a bandwidth limit and the one whose throughput moves first
+// when something else takes the LPDDR5X this SoC shares between the GPU and the
+// CPUs. It is also the denominator of both asserted ratios.
+//
+// Measured on this box, and unlike most of this repository's timing puzzles both
+// sides of the floor are reachable here, so it is a real discriminator rather
+// than a tripwire:
+//
+//   from below -- fifteen consecutive runs on a settled idle box measured
+//   982.5-1079.2 GB/s, and the lowest figure seen on an idle GPU across every
+//   session was 965.3 GB/s. Forty CPU memory streamer threads over 40 GB did not
+//   move it at all: six runs measured 1026.3-1048.9 GB/s with
+//   padding_beats_conflicts at 1.606-1.635. This puzzle's 8 MB working set stays
+//   inside the 25 MB L2, so CPU-side memory load barely reaches it.
+//
+//   from above -- what does reach it is another process on the GPU. Under two GPU
+//   bandwidth hogs plus 20 CPU streamers, eight runs measured 735.6-757.8 GB/s
+//   and padding_beats_conflicts fell to 1.365-1.435, closing most of the distance
+//   to MARGIN's 1.25. That is the regime this floor exists to refuse.
+//
+// 850 GB/s sits 12 % below the lowest idle observation and 12 % above the
+// highest endangered one, which is as close to the middle of the two populations
+// as this box's data puts it.
+constexpr double QUIET_GBPS = 850.0;
+
+// What TransposePadded reaches on a settled idle box, quoted in the
+// measurement_invalid diagnosis so a reader can see how far off an invalid run
+// was. Measured, not asserted: the low end of the idle spread above.
+constexpr double IDLE_GBPS = 982.5;
+
 // All three kernels are timed together: one rep of each in turn, repeated, and
 // each kernel keeps its own fastest rep.
 //
@@ -181,8 +217,11 @@ int main() {
     const char* names[3] = {"TransposeNaive", "TransposePadded",
                             "TransposeSwizzle"};
     float ms[3];
+    QuietCheck qc{"TransposePadded", "GB/s", QUIET_GBPS, IDLE_GBPS};
+    qc.watch();
     bench_all(kerns, 3, grid, block, d_in, d_out, rows, cols, WARMUP, ITERS,
               REPS, ms);
+    qc.watch();
 
     // A transpose reads every element once and writes it once, so the traffic
     // is fixed at 2 * rows * cols * 4 B no matter which kernel moves it. That
@@ -198,14 +237,27 @@ int main() {
       printf("  %-18s %9.4f %12.1f\n", names[k], ms[k], bytes / (ms[k] * 1e6));
     }
 
+    const double padded_gbps = bytes / (ms[1] * 1e6);
+    qc.report();
+
     const float ratio = ms[0] / ms[1];
-    if (ratio >= MARGIN) {
+    const float sw = ms[2] / ms[1];
+    if (!qc.valid(padded_gbps)) {
+      qc.fail("padding_beats_conflicts and swizzle_matches_padding");
+      printf("FAIL   the two ratios above are printed anyway and are real"
+             " measurements -- of a saturated machine. Under external load all"
+             " three kernels go memory-bound and converge, and the"
+             " shared-memory effect this puzzle is about disappears underneath"
+             " the global traffic.\n");
+      ok = false;
+    } else if (ratio >= MARGIN) {
       printf("PASS padding_beats_conflicts (naive / padded = %.3fx >= %.2fx,"
              " from one extra float per tile row)\n",
              ratio, MARGIN);
     } else {
-      printf("FAIL padding_beats_conflicts: naive / padded = %.3fx, expected"
-             " >= %.2fx\n",
+      printf("FAIL padding_beats_conflicts: ratio %.3fx below margin %.2fx --"
+             " the puzzle's performance claim did not hold on a quiet"
+             " machine\n",
              ratio, MARGIN);
       printf("FAIL   TransposeNaive reads a column of a [%d][%d] tile, whose"
              " row stride is exactly the %d banks, so all %d lanes of a warp"
@@ -215,10 +267,11 @@ int main() {
              " padded kernel really indexes [row][col] and did not accidentally"
              " get the naive tile's shape.\n",
              TILE, TILE, BANKS, block.x, TILE, TILE, TILE + 1);
-      printf("FAIL   a ratio below the margin can also mean another process is"
-             " loading this shared-memory SoC -- the GPU and the CPUs share one"
-             " LPDDR5X, and under contention both kernels go memory-bound and"
-             " converge. Re-run on an idle box.\n");
+      printf("FAIL   this run passed the validity check -- no other process had"
+             " a CUDA context on this GPU, and TransposePadded cleared %.1f"
+             " GB/s -- so another process loading this shared-memory SoC is NOT"
+             " the explanation, and it is not what this FAIL is claiming.\n",
+             padded_gbps);
       printf("FAIL   (running under compute-sanitizer or ncu? set"
              " P32_SKIP_TIMING=1 -- instrumented wall-clock time is not a"
              " measurement of this machine)\n");
@@ -229,21 +282,30 @@ int main() {
     // conflict-freedom for zero bytes, so it has to land on the pad's time
     // from both sides -- being much faster would be as suspicious as being
     // much slower.
-    const float sw = ms[2] / ms[1];
-    if (sw >= SWIZZLE_LO && sw <= SWIZZLE_HI) {
+    //
+    // Guarded by the same validity check as the assert above: a run that is not
+    // a measurement has already FAILed as measurement_invalid, and evaluating a
+    // second wall-clock claim on it would only add a second wrong verdict.
+    if (!qc.valid(padded_gbps)) {
+      // Already diagnosed above; nothing to add and nothing to assert.
+    } else if (sw >= SWIZZLE_LO && sw <= SWIZZLE_HI) {
       printf("PASS swizzle_matches_padding (swizzle / padded = %.3fx, within"
              " [%.2f, %.2f], with 0 B of padding)\n",
              sw, SWIZZLE_LO, SWIZZLE_HI);
     } else {
-      printf("FAIL swizzle_matches_padding: swizzle / padded = %.3fx, expected"
-             " within [%.2f, %.2f]\n",
+      printf("FAIL swizzle_matches_padding: ratio %.3fx outside band [%.2f,"
+             " %.2f] -- the puzzle's performance claim did not hold on a quiet"
+             " machine\n",
              sw, SWIZZLE_LO, SWIZZLE_HI);
       printf("FAIL   an XOR swizzle is conflict-free in both directions, so it"
              " should time like the padded kernel. Above the band, the two"
              " loops probably disagree about where logical [r][c] lives -- a"
              " swizzle applied on the write but not the read is still correct"
              " only if it is a no-op, and is otherwise a conflict of its own."
-             " Below the band, suspect the machine, not the kernel.\n");
+             " Below the band, the validity check above has already ruled out"
+             " the machine -- TransposePadded cleared %.1f GB/s with no other"
+             " process on this GPU -- so look at the swizzle.\n",
+             padded_gbps);
       ok = false;
     }
   }
