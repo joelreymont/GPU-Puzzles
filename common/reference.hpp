@@ -26,6 +26,26 @@ inline int ref_count_gt(const float* a, int n, float thresh) {
 
 // Elementwise references: no accumulation, so a double accumulator would buy
 // nothing — each output is one IEEE float op the GPU performs identically.
+// That is also why the runners that use them compare with tolerance 0: one
+// float add here and one float add in the kernel round the same way, so a
+// mismatch is a bug and never a rounding difference.
+
+inline void ref_add_scalar(const float* a, float* out, int n, float s) {
+  for (int i = 0; i < n; i++) out[i] = a[i] + s;
+}
+
+inline void ref_add(const float* a, const float* b, float* out, int n) {
+  for (int i = 0; i < n; i++) out[i] = a[i] + b[i];
+}
+
+// Outer sum of a column vector and a row vector into a row-major rows x cols
+// matrix: out[r][c] = a[r] + b[c]. `a` holds rows elements, `b` holds cols --
+// each is read by a whole line of the output, which is the broadcast.
+inline void ref_bcast_add(const float* a, const float* b, float* out, int rows,
+                          int cols) {
+  for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++) out[r * cols + c] = a[r] + b[c];
+}
 
 // Forward difference; the last element has no successor and is defined as 0.
 inline void ref_neighbor_diff(const float* a, float* out, int n) {

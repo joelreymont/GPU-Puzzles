@@ -7,13 +7,22 @@
 > synchronization, profiling, occupancy, bank conflicts, tensor cores, clusters,
 > and alignment — following the pedagogical outline of
 > [modular/mojo-gpu-puzzles](https://github.com/modular/mojo-gpu-puzzles)
-> (no code or prose copied). The original puzzles 1–14 are de-Colabbed into
-> `GPU_puzzlers_exec/` (`make test` there). New puzzles live in `problems/`,
-> `skeletons/`, `solutions/`; see the root `Makefile` (`make run P=24`).
+> (no code or prose copied), and ports dshah3's puzzles 1–8 into the same
+> three-tree format with a real harness. The original puzzles 1–14 are also
+> de-Colabbed as-is into `GPU_puzzlers_exec/` (`make test` there). Ported
+> puzzles live in `problems/`, `skeletons/`, `solutions/`; see the root
+> `Makefile` (`make run P=01`).
 > Target hardware: NVIDIA DGX Spark (GB10, `sm_121`, CUDA 13). Apache-2.0
 > throughout, inherited from both upstreams.
 
-## Working the puzzles (24–35)
+## Working the puzzles (01–08, 24–35)
+
+Puzzles 01–08 are the beginner sequence — map, zip, guards, 2D indexing,
+broadcast, blocks, blocked 2D, shared memory — ported from dshah3's originals
+with his kernel semantics kept and his harnesses replaced (real sizes, seeded
+input, CPU references, poisoned outputs, checked launches). Start at `P=01` if
+you have not written CUDA before; `problems/p01_map/README.md` assumes nothing.
+Puzzles 24–35 pick up at warp-level programming and assume all of 01–23.
 
 Each puzzle `NN` is three parallel trees sharing one immutable host harness:
 
@@ -37,9 +46,10 @@ make sync                     # skeletons and solutions still match outside fill
 make test                     # every puzzle in solution mode, PASS/FAIL table
 ```
 
-Work them in order — 24 → 35 builds warp → block → cluster and each README
-leans on the previous ones. A puzzle is done when `make run P=NN` prints all
-PASS and `make check P=NN` is clean.
+Work them in order. 01 → 08 builds thread → block → grid → shared memory, and
+24 → 35 builds warp → block → cluster; each README leans on the previous ones.
+Puzzle numbers are zero-padded, so it is `P=01`, not `P=1`. A puzzle is done
+when `make run P=NN` prints all PASS and `make check P=NN` is clean.
 
 Notes for this box (DGX Spark):
 
@@ -64,9 +74,10 @@ Notes for this box (DGX Spark):
   Re-run on an idle box after a `measurement_invalid`. Every performance number
   in the READMEs was measured here; expect different numbers on other hardware.
 
-The original puzzles 1–14 live in `GPU_puzzlers_exec/` (edit `*_kernel.cu`,
-run `make test` in that directory). Everything below this line is the upstream
-NUMBA/Colab README, kept for lineage.
+The original puzzles 1–14, in dshah3's own form, live in `GPU_puzzlers_exec/`
+(edit `*_kernel.cu`, run `make test` in that directory). Puzzles 9–14 exist
+only there for now. Everything below this line is the upstream NUMBA/Colab
+README, kept for lineage.
 
 ---
 
