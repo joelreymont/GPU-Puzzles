@@ -107,6 +107,37 @@ inline void ref_window_sum(const float* a, float* out, int n, int w) {
   }
 }
 
+// Trailing sliding-window sum: out[i] = a[i-w+1] + ... + a[i], truncated at
+// the start of the array, so the first w-1 outputs sum only the elements that
+// exist. The mirror image of ref_window_sum above: that one reaches forward
+// into a halo the caller supplies past the end, this one reaches backward into
+// the array itself and runs out of elements at the front. One double
+// accumulator per window.
+inline void ref_trail_sum(const float* a, float* out, int n, int w) {
+  for (int i = 0; i < n; i++) {
+    double acc = 0.0;
+    for (int k = (i - w + 1 > 0 ? i - w + 1 : 0); k <= i; k++)
+      acc += (double)a[k];
+    out[i] = (float)acc;
+  }
+}
+
+// 1D correlation against a kernel of length k, zero-padded at the end:
+//   out[i] = sum_{j=0}^{k-1} a[i+j] * b[j],  with a[i+j] read as 0 for i+j >= n.
+// `a` and `out` are n long, `b` is k long. The padding is part of the
+// definition rather than an accident of the launch geometry -- the last k-1
+// windows genuinely run off the end of the signal, and they are outputs. One
+// double accumulator per output.
+inline void ref_conv1d(const float* a, const float* b, float* out, int n,
+                       int k) {
+  for (int i = 0; i < n; i++) {
+    double acc = 0.0;
+    for (int j = 0; j < k && i + j < n; j++)
+      acc += (double)a[i + j] * (double)b[j];
+    out[i] = (float)acc;
+  }
+}
+
 // Iterative 3-point stencil (1D heat diffusion). One step is
 //   next[i] = 0.25*cur[i-1] + 0.5*cur[i] + 0.25*cur[i+1]
 // with clamped indexing at both ends: an out-of-array neighbour is the element
